@@ -13,7 +13,11 @@ import time
 from typing import Optional
 import urllib.request
 
+import pandas as pd
+import numpy as np
+import numpy.typing as npt
 import wfdb
+
 
 log = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
@@ -79,6 +83,9 @@ class DownloadManager:
 class Icentia11k:
     """Manages retrieval of items from the Icentia11k dataset"""
 
+    # Tan et al. 2019 used a frame length of 2^11 + 1 = 2049 (https://arxiv.org/pdf/1910.09570)
+    FRAME_LENGTH = 2049
+
     def __init__(self, dir: Path):
         self.dir = dir
         self.download_manager = DownloadManager(output_dir=self.dir)
@@ -103,7 +110,7 @@ class Icentia11k:
         :length: - the length of the segment to visualize. If `None`, it is set to full segment length
         :download: - download if missing
         """
-        if length <= 0:
+        if length and length <= 0:
             raise ValueError("Expected length greater than 0")
         if start < 0:
             raise ValueError("Expected start greater than or equal to 0")
@@ -113,11 +120,50 @@ class Icentia11k:
         rec: wfdb.Record | wfdb.MultiRecord
         if not length:
             rec = wfdb.rdrecord(segment_dir)
+            ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, shift_samps=True)
         else:
             rec = wfdb.rdrecord(segment_dir, sampfrom=start, sampto=start+length)
-        ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
-        return rec, ann 
+            ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
+        return rec, ann
+    
+    def get_frames_and_labels(self, patient_id: int, segment: int) -> tuple[npt.NDArray, pd.DataFrame]:
+        """Returns a matrix where each row is a frame, and a dataframe with the corresponding labels
+        
+        Example, frame 1 contains only Normal beats, with Normal Sinusal Rhythms
+        Example, frame 2 contains a Premature Atrial Contraction, with Atrial Fibrillation rhythm
+        """
 
+        # TODO: Check if pickle file already created
+
+        # Labels dataframe contains patient id, segment id, frame number, beat type, rhythm type, start idx & end idx of frame relative to recording
+        rec, ann = self.get_recording(patient_id, segment)
+
+        # Chunk the signal into frames
+        signal_data: npt.NDArray = rec.p_signal
+        n_frames = len(signal_data) // self.FRAME_LENGTH
+        # For some reason, the frame length from the paper doesn't evenly divide a standard segment length
+        #   So I decided to chop off the end of the signal_data
+        signal_data = signal_data[:n_frames * self.FRAME_LENGTH]
+        signal_data = signal_data.reshape((n_frames, self.FRAME_LENGTH))
+
+        # Chunk the annotations into frames
+        frame_labels = []
+        frame_boundary_idxs = self.FRAME_LENGTH * np.arange(1, n_frames+1)
+        label_frame_boundary_idxs = np.searchsorted(ann.sample, frame_boundary_idxs)
+        # For each set of labels per frame, collapse into one label
+        start = 0
+        for i in label_frame_boundary_idxs:
+            classes: npt.NDArray = ann.symbol[start:i]
+            classes = np.unique(classes)
+            if len(classes) == 1:
+                frame_labels.append(classes)
+            else:
+                # TODO: How to decide on the single label for a frame? What if there are multiple non-normal labels?
+                frame_labels.append(classes)
+            start = i
+        assert len(frame_labels) == n_frames, "Expected as many labels as frames"
+        return signal_data, frame_labels
+    
 if __name__ == "__main__":
     downloader = DownloadManager(output_dir=Path("./data/icentia11k"))
     
