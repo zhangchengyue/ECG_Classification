@@ -1,0 +1,4 @@
+# ECG file data
+*.atr
+*.hea
+*.dat
