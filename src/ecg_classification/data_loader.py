@@ -13,6 +13,8 @@ import time
 from typing import Optional
 import urllib.request
 
+import wfdb
+
 log = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
 
@@ -37,11 +39,7 @@ class DownloadManager:
         patient_folder = f"p{patient_id:05d}"
         patient_folder_url = self._get_patient_folder_url(patient_folder)
 
-        # Check if already fetched
         write_path = self.output_dir/patient_folder
-        if write_path.exists() and any(write_path.iterdir()):
-            log.info(f"Patient {patient_folder} data already fetched")
-            return
         write_path.mkdir(parents=True, exist_ok=True)
 
         # Define segments to fetch
@@ -57,7 +55,8 @@ class DownloadManager:
 
         # Download files
         for file in files_to_download:
-            if file.exists():
+            if (write_path/file).exists():
+                log.info(f"{file} already fetched")
                 continue
             self.download_file(
                 f"{patient_folder_url}/{file}",
@@ -76,9 +75,51 @@ class DownloadManager:
 
     def _get_patient_folder_url(self, patient_folder: str) -> str:
         return "/".join([self.DATASET_URL, patient_folder[:3], patient_folder])
+    
+class Icentia11k:
+    """Manages retrieval of items from the Icentia11k dataset"""
+
+    def __init__(self, dir: Path):
+        self.dir = dir
+        self.download_manager = DownloadManager(output_dir=self.dir)
+
+    def download(self, patient_id: int, segments: list[int]) -> None:
+        """Download patient files"""
+        self.download_manager.fetch_patient_data(patient_id, segments)
+
+    def _get_path(self, patient_id: int, segment: int) -> Path:
+        patient_folder = f"p{patient_id:05d}"
+        path = self.dir/Path(patient_folder, f"{patient_folder}_s{segment:02d}")
+        return path
+    
+    def get_recording(self,
+            patient_id: int, segment: int,
+            start: int = 0, length: Optional[int] = None
+        ) -> tuple[wfdb.Record | wfdb.MultiRecord, wfdb.Annotation]:
+        """Returns the recording and annotation data in `segment_dir`.
+        
+
+        :start: - the starting time/sample. Ignored if length is `None`.
+        :length: - the length of the segment to visualize. If `None`, it is set to full segment length
+        :download: - download if missing
+        """
+        if length <= 0:
+            raise ValueError("Expected length greater than 0")
+        if start < 0:
+            raise ValueError("Expected start greater than or equal to 0")
+
+        segment_dir = str(self._get_path(patient_id, segment))
+
+        rec: wfdb.Record | wfdb.MultiRecord
+        if not length:
+            rec = wfdb.rdrecord(segment_dir)
+        else:
+            rec = wfdb.rdrecord(segment_dir, sampfrom=start, sampto=start+length)
+        ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
+        return rec, ann 
 
 if __name__ == "__main__":
     downloader = DownloadManager(output_dir=Path("./data/icentia11k"))
     
-    for patient_id in [8, 108, 1008]:
+    for patient_id in [8, 108, 900, 1008, 1100, 9000]:
         downloader.fetch_patient_data(patient_id, n_rand_segments=3)

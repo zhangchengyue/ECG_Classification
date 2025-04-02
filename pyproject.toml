@@ -1,0 +1,3 @@
+[project]
+name = "ecg-classification"
+version = "0.1"

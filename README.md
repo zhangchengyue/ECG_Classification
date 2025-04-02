@@ -1,6 +1,8 @@
 # ECG_Classification
 
 
-TODO:
+## Usage
 
-- Something to load data
+Download data
+
+Convert data files
