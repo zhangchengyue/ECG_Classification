@@ -133,6 +133,8 @@ class Icentia11k:
         if start < 0:
             raise ValueError("Expected start greater than or equal to 0")
 
+        if not self._get_path(patient_id, segment).exists():
+            self.download(patient_id, [segment])
         segment_dir = str(self._get_path(patient_id, segment))
 
         rec: wfdb.Record | wfdb.MultiRecord
@@ -215,6 +217,52 @@ class Icentia11k:
             start = i
         assert len(beat_classes) == n_frames, "Expected as many beat labels as frames"
         return signal_data, np.array(beat_classes), np.array(rhythm_classes)
+    
+    def create_supervised_training_data(self, patient_ids: list[int], segments: list[int]) -> None:
+        """Creates a set of training data"""
+        if not segments:
+            raise ValueError("Expected at least one segment")
+        frames = []
+        rhythm_classes = []
+        for patient_id in patient_ids:
+            for seg in segments:
+                frame, beat, rhythm = self.get_frames_and_labels(patient_id, seg)
+                frames.append(frame)
+                rhythm_classes.append(rhythm)
+        # TODO: Consider creating another array that indicates which segment a frame came from
+
+        frames = np.vstack(frames)
+        rhythm_classes = np.vstack(rhythm_classes)
+        filepath = self.dir/"icentia11k_npz"
+        filepath.mkdir(parents=True, exist_ok=True)
+
+        np.savez(
+            filepath/f"train.npz",
+            signal=np.expand_dims(frames, axis=-1),
+            rhythm=rhythm_classes,
+            qa_label=np.zeros((len(frames), 3)),
+            patient_id=patient_id,
+        )
+
+    def load_all_npz(self, folder: Path) -> dict[str, npt.NDArray]:
+        """Loads all npz files in a directory and concatenates them"""
+        frames = []
+        rhythm_classes = []
+        for file in folder.glob("*.npz"):
+            contents = np.load(file)
+            frames.append(contents["signal"])
+            rhythm_classes.append(contents["rhythm"])
+            
+        frames = np.vstack(frames)
+        rhythm_classes = np.vstack(rhythm_classes)
+        return {"signal": np.expand_dims(frames, axis=-1), "rhythm": rhythm_classes, "qa_labels": np.zeros((frames.shape[0], 3))}
+
+    def count_classes(self, npz_array_data: Path) -> dict[str, int]:
+        """Prints class imbalance for a npz of signals and classes"""
+        array_data = np.load(npz_array_data)
+        rhythm_labels: npt.NDArray = array_data["rhythm"]
+        class_counts = rhythm_labels.sum(axis=0)
+        return {"Normal": class_counts[0], "Abnormal": class_counts[1]}
     
 if __name__ == "__main__":
     downloader = DownloadManager(output_dir=Path("./data/icentia11k"))
