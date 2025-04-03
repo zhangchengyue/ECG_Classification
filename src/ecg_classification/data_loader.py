@@ -158,6 +158,8 @@ class Icentia11k:
         for c in classes:
             if c in self.beat_mapping:
                 encoded[self.beat_mapping[c]] = 1
+        frame_has_abnormal_beat = encoded[1] ^ encoded[2]
+        encoded = np.array([not int(frame_has_abnormal_beat), frame_has_abnormal_beat])
         return encoded
     
     def reclassify_rhythm_for_frame(self, rhythm_labels_in_frame: npt.NDArray) -> npt.NDArray:
@@ -223,15 +225,18 @@ class Icentia11k:
         if not segments:
             raise ValueError("Expected at least one segment")
         frames = []
+        beats = []
         rhythm_classes = []
         for patient_id in patient_ids:
             for seg in segments:
                 frame, beat, rhythm = self.get_frames_and_labels(patient_id, seg)
                 frames.append(frame)
+                beats.append(beat)
                 rhythm_classes.append(rhythm)
         # TODO: Consider creating another array that indicates which segment a frame came from
 
         frames = np.vstack(frames)
+        beats = np.vstack(beats)
         rhythm_classes = np.vstack(rhythm_classes)
         filepath = self.dir/"icentia11k_npz"
         filepath.mkdir(parents=True, exist_ok=True)
@@ -240,8 +245,7 @@ class Icentia11k:
             filepath/f"train.npz",
             signal=np.expand_dims(frames, axis=-1),
             rhythm=rhythm_classes,
-            qa_label=np.zeros((len(frames), 3)),
-            patient_id=patient_id,
+            beat=beats,
         )
 
     def load_all_npz(self, folder: Path) -> dict[str, npt.NDArray]:
