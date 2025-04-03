@@ -167,6 +167,8 @@ class Icentia11k:
         for c in classes:
             if c in self.rhythm_mapping:
                 encoded[self.rhythm_mapping[c]] = 1
+        frame_has_abnormal_rhythm = encoded[1] ^ encoded[2]
+        encoded = np.array([not int(frame_has_abnormal_rhythm), frame_has_abnormal_rhythm])
         return encoded
     
     def get_frames_and_labels(self, patient_id: int, segment: int, drop_empty: bool = True) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
