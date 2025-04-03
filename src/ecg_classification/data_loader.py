@@ -18,7 +18,6 @@ import numpy as np
 import numpy.typing as npt
 import wfdb
 
-
 log = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
 
@@ -83,12 +82,32 @@ class DownloadManager:
 class Icentia11k:
     """Manages retrieval of items from the Icentia11k dataset"""
 
-    # Tan et al. 2019 used a frame length of 2^11 + 1 = 2049 (https://arxiv.org/pdf/1910.09570)
-    FRAME_LENGTH = 2049
+    # TODO: Figure out how to obtain balanced split of the data
 
-    def __init__(self, dir: Path):
+    # TODO: Impl method to count labels in currently downloaded dataset, like https://github.com/shawntan/icentia-ecg/blob/master/physionet/count_everything.py
+
+    label_mapping = {"btype": {0: ('Q', ''),       # Undefined: Unclassifiable beat
+                           1: ('N', ''),       # Normal: Normal beat
+                           2: ('S', ''),       # ESSV (PAC): Premature or ectopic supraventricular beat
+                           3: ('a', ''),       # Aberrated: Aberrated atrial premature beat
+                           4: ('V', '')},      # ESV (PVC): Premature ventricular contraction
+                 "rtype": {0: ('', ''),        # Null/Undefined
+                           1: ('', ''),        # End
+                           2: ('', ''),        # Noise
+                           3: ('+', "(N"),     # NSR (normal sinusal rhythm): Normal sinusal rhythm
+                           4: ('+', "(AFIB"),  # AFib: Atrial fibrillation
+                           5: ('+', "(AFL"),   # AFlutter: Atrial flutter
+                           6: (None, None)}}   # Used to split a rhythm when a beat annotation is not
+                                               # linked to a rhythm type
+
+    beat_mapping = {'N': 0, 'S': 1, 'V': 2}
+    rhythm_mapping = {'(N': 0, '(AFIB': 1, '(AFL': 2}
+
+    def __init__(self, dir: Path, frame_length: int):
         self.dir = dir
         self.download_manager = DownloadManager(output_dir=self.dir)
+        # Tan et al. 2019 used a frame length of 2^11 + 1 = 2049 (https://arxiv.org/pdf/1910.09570)
+        self.frame_length = frame_length
 
     def download(self, patient_id: int, segments: list[int]) -> None:
         """Download patient files"""
@@ -105,7 +124,6 @@ class Icentia11k:
         ) -> tuple[wfdb.Record | wfdb.MultiRecord, wfdb.Annotation]:
         """Returns the recording and annotation data in `segment_dir`.
         
-
         :start: - the starting time/sample. Ignored if length is `None`.
         :length: - the length of the segment to visualize. If `None`, it is set to full segment length
         :download: - download if missing
@@ -126,11 +144,40 @@ class Icentia11k:
             ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
         return rec, ann
     
-    def get_frames_and_labels(self, patient_id: int, segment: int) -> tuple[npt.NDArray, pd.DataFrame]:
+    def reclassify_beat_for_frame(self, beat_labels_in_frame: npt.NDArray|list[str]) -> npt.NDArray:
+        """Relabels the class for a given set of beat labels in a single frame
+        
+        A single frame can contain multiple labelled beats. So, these need to be combined in some way such that the frame
+        as a whole has only one class for a given classification task
+        """
+
+        classes = np.unique(beat_labels_in_frame)
+        encoded = np.array([0, 0, 0]) # N, S, V
+        for c in classes:
+            if c in self.beat_mapping:
+                encoded[self.beat_mapping[c]] = 1
+        return encoded
+    
+    def reclassify_rhythm_for_frame(self, rhythm_labels_in_frame: npt.NDArray) -> npt.NDArray:
+        """Reclassifies the rhythm for a frame, given a set of rhythm labels"""
+        # TODO: Encode the expected classes as multi-label so we can calculate cross-entropy loss
+        classes = np.unique(rhythm_labels_in_frame)
+        log.debug(classes)
+        encoded = np.array([0, 0, 0]) # N, AFIB, AFL
+        for c in classes:
+            if c in self.rhythm_mapping:
+                encoded[self.rhythm_mapping[c]] = 1
+        return encoded
+    
+    def get_frames_and_labels(self, patient_id: int, segment: int, drop_empty: bool = True) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
         """Returns a matrix where each row is a frame, and a dataframe with the corresponding labels
         
         Example, frame 1 contains only Normal beats, with Normal Sinusal Rhythms
         Example, frame 2 contains a Premature Atrial Contraction, with Atrial Fibrillation rhythm
+
+        :patient_id:
+        :segment: 
+        :drop_empty: decide whether to drop empty frames
         """
 
         # TODO: Check if pickle file already created
@@ -140,29 +187,32 @@ class Icentia11k:
 
         # Chunk the signal into frames
         signal_data: npt.NDArray = rec.p_signal
-        n_frames = len(signal_data) // self.FRAME_LENGTH
+        n_frames = len(signal_data) // self.frame_length
         # For some reason, the frame length from the paper doesn't evenly divide a standard segment length
         #   So I decided to chop off the end of the signal_data
-        signal_data = signal_data[:n_frames * self.FRAME_LENGTH]
-        signal_data = signal_data.reshape((n_frames, self.FRAME_LENGTH))
+        signal_data = signal_data[:n_frames * self.frame_length]
+        signal_data = signal_data.reshape((n_frames, self.frame_length))
 
         # Chunk the annotations into frames
-        frame_labels = []
-        frame_boundary_idxs = self.FRAME_LENGTH * np.arange(1, n_frames+1)
+        beat_classes = []
+        rhythm_classes = []
+
+        frame_boundary_idxs = self.frame_length * np.arange(1, n_frames+1)
         label_frame_boundary_idxs = np.searchsorted(ann.sample, frame_boundary_idxs)
-        # For each set of labels per frame, collapse into one label
+
         start = 0
         for i in label_frame_boundary_idxs:
-            classes: npt.NDArray = ann.symbol[start:i]
-            classes = np.unique(classes)
-            if len(classes) == 1:
-                frame_labels.append(classes)
-            else:
-                # TODO: How to decide on the single label for a frame? What if there are multiple non-normal labels?
-                frame_labels.append(classes)
+            # Beats
+            beat_labels: npt.NDArray = ann.symbol[start:i]
+            beat_classes.append(self.reclassify_beat_for_frame(beat_labels))
+
+            # TODO: Get rhythm labels
+            rhythm_labels: npt.NDArray = ann.aux_note[start:i]
+            rhythm_classes.append(self.reclassify_rhythm_for_frame(rhythm_labels))
+
             start = i
-        assert len(frame_labels) == n_frames, "Expected as many labels as frames"
-        return signal_data, frame_labels
+        assert len(beat_classes) == n_frames, "Expected as many beat labels as frames"
+        return signal_data, np.array(beat_classes), np.array(rhythm_classes)
     
 if __name__ == "__main__":
     downloader = DownloadManager(output_dir=Path("./data/icentia11k"))
