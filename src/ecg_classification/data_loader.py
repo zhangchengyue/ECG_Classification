@@ -13,6 +13,7 @@ import time
 from typing import Optional
 import urllib.request
 
+from sklearn.preprocessing import OrdinalEncoder
 import pandas as pd
 import numpy as np
 import numpy.typing as npt
@@ -35,8 +36,10 @@ class DownloadManager:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def fetch_patient_data(self, patient_id: int, segments: Optional[list[int]] = None, n_rand_segments: Optional[int] = None) -> None:
-        """Downloads data of patient `patient_id`.
-        Will only fetch the segments specified by `segments`, OR will randomly fetch `n_rand_segments` segments.
+        """Fetches patient data from Icentia11k dataset
+        
+        The data is hosted at PhysioNet (https://physionet.org/files/icentia11k-continuous-ecg/1.0)
+        Refer to Tan et al. https://arxiv.org/pdf/1910.09570 for more information.
         """
 
         patient_folder = f"p{patient_id:05d}"
@@ -78,13 +81,38 @@ class DownloadManager:
 
     def _get_patient_folder_url(self, patient_folder: str) -> str:
         return "/".join([self.DATASET_URL, patient_folder[:3], patient_folder])
-    
+
+class LabelManager:
+
+    def __init__(self):
+        self.beat_encoder = OrdinalEncoder().fit([""])
+        self.rhythm_encoder = OrdinalEncoder()
+
+    def encode_presence_absence(self, set_of_labels: npt.NDArray|list[str], categories: list[str]):
+        categories = {class_label:idx for idx, class_label in enumerate(categories)}
+        classes = np.unique(set_of_labels)
+        encoded = np.zeros(len(categories)) # N, S, V
+        for c in classes:
+            if c in categories:
+                encoded[categories[c]] = 1
+        return encoded
+
+    def reclassify_beats_in_frame(self, frame_labels: npt.NDArray) -> npt.NDArray:
+        """Returns beat classification for a frame.
+        
+        A given frame contains either all Normal beats, or at least one Abnormal beat.
+        The two classes are:
+        0 - All normal beats
+        1 - At least one abnormal beat
+        """
+        
+
+    def reclassify_rhythm_in_frame(self, frame_labels: npt.NDArray) -> npt.NDArray:
+        pass
+
+
 class Icentia11k:
-    """Manages retrieval of items from the Icentia11k dataset"""
-
-    # TODO: Figure out how to obtain balanced split of the data
-
-    # TODO: Impl method to count labels in currently downloaded dataset, like https://github.com/shawntan/icentia-ecg/blob/master/physionet/count_everything.py
+    """Interface to work with the Icentia11k dataset"""
 
     label_mapping = {"btype": {0: ('Q', ''),       # Undefined: Unclassifiable beat
                            1: ('N', ''),       # Normal: Normal beat
@@ -110,10 +138,14 @@ class Icentia11k:
         self.frame_length = frame_length
 
     def download(self, patient_id: int, segments: list[int]) -> None:
-        """Download patient files"""
+        """Downloads patient ECG recordings from Icentia11k dataset"""
         self.download_manager.fetch_patient_data(patient_id, segments)
 
     def _get_path(self, patient_id: int, segment: int) -> Path:
+        """Gets local path to patient ECG recording
+        
+        Naming convention for folders is the same as in PhysioNet
+        """
         patient_folder = f"p{patient_id:05d}"
         path = self.dir/Path(patient_folder, f"{patient_folder}_s{segment:02d}")
         return path
@@ -124,9 +156,10 @@ class Icentia11k:
         ) -> tuple[wfdb.Record | wfdb.MultiRecord, wfdb.Annotation]:
         """Returns the recording and annotation data in `segment_dir`.
         
-        :start: - the starting time/sample. Ignored if length is `None`.
-        :length: - the length of the segment to visualize. If `None`, it is set to full segment length
-        :download: - download if missing
+        Args:
+            start - the starting time/sample. Ignored if length is `None`.
+            length - the length of the segment to visualize. If `None`, it is set to full segment length
+            download - download if missing
         """
         if length and length <= 0:
             raise ValueError("Expected length greater than 0")
@@ -146,13 +179,14 @@ class Icentia11k:
             ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
         return rec, ann
     
+    # TODO: Refactor this and the rhythm classification function - could probably replace with a call to sklearn.OrdinalEncoder
     def reclassify_beat_for_frame(self, beat_labels_in_frame: npt.NDArray|list[str]) -> npt.NDArray:
         """Relabels the class for a given set of beat labels in a single frame
         
         A single frame can contain multiple labelled beats. So, these need to be combined in some way such that the frame
         as a whole has only one class for a given classification task
         """
-
+        # TODO: Consider using sklearn OrdinalEncoder
         classes = np.unique(beat_labels_in_frame)
         encoded = np.array([0, 0, 0]) # N, S, V
         for c in classes:
@@ -166,7 +200,6 @@ class Icentia11k:
         """Reclassifies the rhythm for a frame, given a set of rhythm labels"""
         # TODO: Encode the expected classes as multi-label so we can calculate cross-entropy loss
         classes = np.unique(rhythm_labels_in_frame)
-        log.debug(classes)
         encoded = np.array([0, 0, 0]) # N, AFIB, AFL
         for c in classes:
             if c in self.rhythm_mapping:
@@ -176,7 +209,7 @@ class Icentia11k:
         return encoded
     
     def get_frames_and_labels(self, patient_id: int, segment: int, drop_empty: bool = True) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
-        """Returns a matrix where each row is a frame, and a dataframe with the corresponding labels
+        """Returns frames of ECG signal, and the corresponding beat and rhythm labels per frame
         
         Example, frame 1 contains only Normal beats, with Normal Sinusal Rhythms
         Example, frame 2 contains a Premature Atrial Contraction, with Atrial Fibrillation rhythm
@@ -186,14 +219,12 @@ class Icentia11k:
         :drop_empty: decide whether to drop empty frames
         """
 
-        # TODO: Check if pickle file already created
-
-        # Labels dataframe contains patient id, segment id, frame number, beat type, rhythm type, start idx & end idx of frame relative to recording
         rec, ann = self.get_recording(patient_id, segment)
 
         # Chunk the signal into frames
         signal_data: npt.NDArray = rec.p_signal
         n_frames = len(signal_data) // self.frame_length
+
         # For some reason, the frame length from the paper doesn't evenly divide a standard segment length
         #   So I decided to chop off the end of the signal_data
         signal_data = signal_data[:n_frames * self.frame_length]
@@ -212,7 +243,7 @@ class Icentia11k:
             beat_labels: npt.NDArray = ann.symbol[start:i]
             beat_classes.append(self.reclassify_beat_for_frame(beat_labels))
 
-            # TODO: Get rhythm labels
+            # Rhythm
             rhythm_labels: npt.NDArray = ann.aux_note[start:i]
             rhythm_classes.append(self.reclassify_rhythm_for_frame(rhythm_labels))
 
@@ -220,6 +251,7 @@ class Icentia11k:
         assert len(beat_classes) == n_frames, "Expected as many beat labels as frames"
         return signal_data, np.array(beat_classes), np.array(rhythm_classes)
     
+    # TODO: Figure out how to obtain balanced split of the data
     def create_supervised_training_data(self, patient_ids: list[int], segments: list[int]) -> None:
         """Creates a set of training data"""
         if not segments:
@@ -238,28 +270,16 @@ class Icentia11k:
         frames = np.vstack(frames)
         beats = np.vstack(beats)
         rhythm_classes = np.vstack(rhythm_classes)
-        filepath = self.dir/"icentia11k_npz"
+        filepath = self.dir
         filepath.mkdir(parents=True, exist_ok=True)
 
+        # TODO: Create metadata.json file that describes mapping
         np.savez(
             filepath/f"train.npz",
             signal=np.expand_dims(frames, axis=-1),
             rhythm=rhythm_classes,
             beat=beats,
         )
-
-    def load_all_npz(self, folder: Path) -> dict[str, npt.NDArray]:
-        """Loads all npz files in a directory and concatenates them"""
-        frames = []
-        rhythm_classes = []
-        for file in folder.glob("*.npz"):
-            contents = np.load(file)
-            frames.append(contents["signal"])
-            rhythm_classes.append(contents["rhythm"])
-            
-        frames = np.vstack(frames)
-        rhythm_classes = np.vstack(rhythm_classes)
-        return {"signal": np.expand_dims(frames, axis=-1), "rhythm": rhythm_classes, "qa_labels": np.zeros((frames.shape[0], 3))}
 
     def count_classes(self, npz_array_data: Path) -> dict[str, int]:
         """Prints class imbalance for a npz of signals and classes"""
