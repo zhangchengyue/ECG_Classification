@@ -116,7 +116,6 @@ class ECGLabelEncoder:
         1 - At least one abnormal beat
         """
         encoding = self.encode_presence_absence(frame_labels, self.beat_categories)
-        print(encoding)
         # Remember, first element in categories is normal, rest are subtypes of abnormal beats
         has_abnormal_beats = np.bitwise_xor.reduce(encoding[1:])
         return np.array([int(not has_abnormal_beats), has_abnormal_beats])
@@ -262,7 +261,7 @@ class Icentia11k:
         description = {}
 
         description["num_frames"] = ecg_data["signal"].shape[0]
-        description["beat_class_counts"] = np.sum(ecg_data["rhythm"], axis=0)
+        description["beat_class_counts"] = np.sum(ecg_data["beat"], axis=0)
         description["rhythm_class_counts"] = np.sum(ecg_data["rhythm"], axis=0)
         return description
     
