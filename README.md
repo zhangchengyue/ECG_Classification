@@ -25,6 +25,11 @@ python3 -m pip install -e .
 
 Refer to the [eda.ipynb](nbs/eda.ipynb) notebook for a short example of how to download and visualize the data from Icentia11k.
 
-### Run the ECG Classification Model
+### ECG Classification Model
 
-Refer to the [multitask_learning_synapse.ipynb](nbs/multitask_learning_synapse.ipynb) notebook for an example of how to train and test the example multi-task learning model.
+Refer to the [DeepBeat.ipynb](nbs/DeepBeat.ipynb) notebook for an example of how to train and test the example multi-task learning model.
+The model is reproduced from [Torres-Soto & Ashley, 2020](https://www.nature.com/articles/s41746-020-00320-4).
+
+### Multi-Task Learning for Arrythmia Detection and SupraVentricular/Ventricular Ectopic Beat Classification
+
+Refer to the [Icentia_rhythm_SV.ipynb](nbs/Icentia_rhythm_SV.ipynb) notebook for our multi-task learning model.
