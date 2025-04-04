@@ -21,7 +21,7 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
 
-### Download and Visualie the Data
+### Download and Visualize the Data
 
 Refer to the [eda.ipynb](nbs/eda.ipynb) notebook for a short example of how to download and visualize the data from Icentia11k.
 
