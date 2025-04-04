@@ -33,3 +33,5 @@ The model is reproduced from [Torres-Soto & Ashley, 2020](https://www.nature.com
 ### Multi-Task Learning for Arrythmia Detection and SupraVentricular/Ventricular Ectopic Beat Classification
 
 Refer to the [Icentia_rhythm_SV.ipynb](nbs/Icentia_rhythm_SV.ipynb) notebook for our multi-task learning model.
+
+The pretrained CDAE weights can be downloaded from [here](https://drive.google.com/drive/folders/1xr5juWS7EHi4iN8-RzxcgmlxBvfDmCeI?usp=sharing).
