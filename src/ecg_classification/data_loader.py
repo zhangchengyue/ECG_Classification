@@ -247,7 +247,7 @@ class Icentia11k:
         beat_classes = np.vstack(beat_classes, dtype=np.int8)
         rhythm_classes = np.vstack(rhythm_classes, dtype=np.int8)
 
-        np.savez(
+        np.savez_compressed(
             self.dir/"train.npz",
             signal=np.expand_dims(frames, axis=-1),
             rhythm=rhythm_classes,
