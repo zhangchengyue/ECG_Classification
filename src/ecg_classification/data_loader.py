@@ -6,6 +6,7 @@ For dataset details refer to:
 https://physionet.org/content/icentia11k-continuous-ecg/1.0/
 """
 
+from dataclasses import dataclass
 import logging
 from pathlib import Path
 import random
@@ -21,7 +22,6 @@ import wfdb
 log = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
 
-random.seed(1453)
 
 class DownloadManager:
     """Manages downloads for dataset"""
@@ -80,6 +80,15 @@ class DownloadManager:
 
     def _get_patient_folder_url(self, patient_folder: str) -> str:
         return "/".join([self.DATASET_URL, patient_folder[:3], patient_folder])
+    
+    def get_patient_folder_path(self, patient_id: int, segment: int) -> Path:
+        """Gets local path to patient ECG recording
+        
+        Naming convention for folders is the same as in PhysioNet
+        """
+        patient_folder = f"p{patient_id:05d}"
+        path = self.output_dir/Path(patient_folder, f"{patient_folder}_s{segment:02d}")
+        return path
 
 class ECGLabelEncoder:
     """Encodes labels for ECG recordings"""
@@ -133,30 +142,29 @@ class ECGLabelEncoder:
         has_abnormal_rhythm = np.bitwise_xor.reduce(encoding[1:])
         return np.array([int(not has_abnormal_rhythm), has_abnormal_rhythm])
 
+@dataclass
+class ECGData:
+    frames: npt.NDArray
+    beat_classes: npt.NDArray
+    rhythm_classes: npt.NDArray
+    patient_ids: npt.NDArray
 
 class Icentia11k:
     """Interface to work with the Icentia11k dataset"""
 
-    def __init__(self, dir: Path, frame_length: int):
+    # Tan et al. 2019 remove labels patient ids < 9000. They keep labels for 'test set', i.e. patient id >= 9000
+    train_patient_ids = (9_000, 9_999)
+    test_patient_ids = (10_000, 10_999)
+
+    def __init__(self, dir: Path, frame_length: int, seed: int):
         self.dir = dir
         self.download_manager = DownloadManager(output_dir=self.dir)
         self.ecg_encoder = ECGLabelEncoder()
         # Tan et al. 2019 used a frame length of 2^11 + 1 = 2049 (https://arxiv.org/pdf/1910.09570)
         self.frame_length = frame_length
 
-    def download(self, patient_id: int, segments: list[int]) -> None:
-        """Downloads patient ECG recordings from Icentia11k dataset"""
-        self.download_manager.fetch_patient_data(patient_id, segments)
+        self.rng = np.random.default_rng(seed=seed)
 
-    def get_patient_folder_path(self, patient_id: int, segment: int) -> Path:
-        """Gets local path to patient ECG recording
-        
-        Naming convention for folders is the same as in PhysioNet
-        """
-        patient_folder = f"p{patient_id:05d}"
-        path = self.dir/Path(patient_folder, f"{patient_folder}_s{segment:02d}")
-        return path
-    
     def get_recording(self,
             patient_id: int, segment: int,
             start: int = 0, length: Optional[int] = None,
@@ -174,7 +182,7 @@ class Icentia11k:
         if start < 0:
             raise ValueError("Expected start greater than or equal to 0")
 
-        segment_dir = self.get_patient_folder_path(patient_id, segment)
+        segment_dir = self.download_manager.get_patient_folder_path(patient_id, segment)
         if not segment_dir.exists() and download_if_missing:
             self.download_manager.fetch_patient_data(patient_id, segments=[segment])
         segment_dir = str(segment_dir)
@@ -188,7 +196,7 @@ class Icentia11k:
             ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
         return rec, ann
         
-    def get_frames_and_labels(self, patient_id: int, segment: int) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
+    def get_frames_and_labels(self, patient_id: int, segment: int) -> ECGData:
         """Returns frames of ECG signal, and the corresponding beat and rhythm labels per frame
         
         Example, frame 1 contains only Normal beats, with Normal Sinusal Rhythms
@@ -222,37 +230,66 @@ class Icentia11k:
             rhythm_classes.append(self.ecg_encoder.reclassify_rhythm_in_frame(rhythm_in_frame))
 
             start = i
+
         assert len(beat_classes) == n_frames, "Expected as many beat labels as frames"
         assert len(rhythm_classes) == n_frames, "Expected as many rhythm labels as frames"
-        return signal_data, np.array(beat_classes, dtype=np.int8), np.array(rhythm_classes, dtype=np.int8)
+
+        return ECGData(
+            frames=signal_data,
+            beat_classes=np.array(beat_classes, dtype=np.int8),
+            rhythm_classes=np.array(rhythm_classes, dtype=np.int8),
+            patient_ids=np.repeat(patient_id, n_frames),
+        )
     
-    # TODO: Figure out how to obtain balanced split of the data
-    def create_supervised_training_data(self, patient_ids: list[int], segments: list[int]) -> None:
-        """Creates a set of training data"""
+    def get_aggregate_frames_and_labels(self, patient_ids: list[int], segments: list[int]) -> ECGData:
+        """Aggregate frames and labels for multiple patients and segments"""
         if not segments:
             raise ValueError("Expected at least one segment")
         
         frames = []
         beat_classes = []
         rhythm_classes = []
+        patients = []
 
         for patient_id in patient_ids:
             for seg in segments:
-                frame, beat, rhythm = self.get_frames_and_labels(patient_id, seg)
-                frames.append(frame)
-                beat_classes.append(beat)
-                rhythm_classes.append(rhythm)
+                ecg_data = self.get_frames_and_labels(patient_id, seg)
+                frames.append(ecg_data.frames)
+                beat_classes.append(ecg_data.beat_classes)
+                rhythm_classes.append(ecg_data.rhythm_classes)
+                patients.append(ecg_data.patient_ids)
 
         frames = np.vstack(frames)
         beat_classes = np.vstack(beat_classes, dtype=np.int8)
         rhythm_classes = np.vstack(rhythm_classes, dtype=np.int8)
+        patients = np.vstack(patients)
 
+        return ECGData(frames, beat_classes, rhythm_classes, patients)
+
+    def _create_supervised_data_split(self, split_name: str, size: int, patient_id_range: tuple[int, int], segments: list[int]) -> None:
+        """Creates a split of ECG data"""
+        patient_ids = self.rng.integers(low=patient_id_range[0], high=patient_id_range[1]+1, size=size)
+        ecg_data = self.get_aggregate_frames_and_labels(patient_ids, segments)
         np.savez_compressed(
-            self.dir/"train.npz",
-            signal=np.expand_dims(frames, axis=-1),
-            rhythm=rhythm_classes,
-            beat=beat_classes,
+            self.dir/f"{split_name}.npz",
+            signal=np.expand_dims(ecg_data.frames, axis=-1),
+            rhythm=ecg_data.rhythm_classes,
+            beat=ecg_data.beat_classes,
+            patient=ecg_data.patient_ids,
         )
+    
+    def create_supervised_train_test_data(self, train_size: int, test_size: int, segments: list[int]) -> None:
+        """Creates a training and test sets.
+        
+        To prevent data leakage, it's important that different patients are used for train and test sets.
+        
+        Args:
+            train_size - Number of patients to include in training set
+            test_size - Number of patients to include in test set
+            segments - id of specific segments to include, regardless of patient id
+        """
+        self._create_supervised_data_split("train", train_size, self.train_patient_ids, segments)
+        self._create_supervised_data_split("test", test_size, self.test_patient_ids, segments)
 
     def describe_ecg_npz(self, npz_ecg_data: Path) -> dict[str, int]:
         """Describes class distribution in npz file"""
@@ -262,11 +299,15 @@ class Icentia11k:
 
         description["num_frames"] = ecg_data["signal"].shape[0]
         description["beat_class_counts"] = np.sum(ecg_data["beat"], axis=0)
+        description["beat_class_proportion"] = np.round(description["beat_class_counts"] / description["num_frames"], 2)
         description["rhythm_class_counts"] = np.sum(ecg_data["rhythm"], axis=0)
+        description["rhythm_class_proportion"] = np.round(description["rhythm_class_counts"] / description["num_frames"], 2)
+        description["patient_ids"] = np.unique(ecg_data["patient"])
         return description
     
 if __name__ == "__main__":
-    downloader = DownloadManager(output_dir=Path("./data/icentia11k"))
-    
-    for patient_id in [8, 108, 900, 1008, 1100, 9000]:
-        downloader.fetch_patient_data(patient_id, n_rand_segments=3)
+    dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800, seed=2025)
+    dataset.create_supervised_train_test_data(train_size=5, test_size=5, segments=[0, 37]) # 0 & 37 are arbitrary
+
+    print("Train", dataset.describe_ecg_npz(dataset.dir/"train.npz"), end="\n\n")
+    print("Test", dataset.describe_ecg_npz(dataset.dir/"test.npz"), end="\n\n")

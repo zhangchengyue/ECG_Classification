@@ -1,7 +1,10 @@
-from ecg_classification.data_loader import ECGLabelEncoder
+from pathlib import Path
 
 import numpy as np
 import pytest
+
+from ecg_classification.data_loader import ECGLabelEncoder, Icentia11k
+
 
 def test_encode_presence_absence():
     encoder = ECGLabelEncoder()
