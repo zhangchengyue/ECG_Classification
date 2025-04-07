@@ -149,12 +149,20 @@ class ECGData:
     rhythm_classes: npt.NDArray
     patient_ids: npt.NDArray
 
+class TrainTestSplit:
+    pass
+
+class Summarizer:
+    pass
+
 class Icentia11k:
     """Interface to work with the Icentia11k dataset"""
 
     # Tan et al. 2019 remove labels patient ids < 9000. They keep labels for 'test set', i.e. patient id >= 9000
     train_patient_ids = (9_000, 9_999)
     test_patient_ids = (10_000, 10_999)
+    # TODO: Train/test split might be better as 0.7 train and 0.3 test
+    # TODO: Stratify splits by class distribution, not by patient id's
 
     def __init__(self, dir: Path, frame_length: int, seed: int):
         self.dir = dir
@@ -266,6 +274,7 @@ class Icentia11k:
 
         return ECGData(frames, beat_classes, rhythm_classes, patients)
 
+    # TODO: Swap with Scikit-Learn's StratifiedKFoldSplit
     def _create_supervised_data_split(self, split_name: str, size: int, patient_id_range: tuple[int, int], segments: list[int]) -> None:
         """Creates a split of ECG data"""
         patient_ids = self.rng.integers(low=patient_id_range[0], high=patient_id_range[1]+1, size=size)
@@ -278,6 +287,8 @@ class Icentia11k:
             patient=ecg_data.patient_ids,
         )
     
+    # TODO: Create train and test in a stratified manner ...
+    # TODO: Change train_size & test_size to accept proportions instead of absolute amounts
     def create_supervised_train_test_data(self, train_size: int, test_size: int, segments: list[int]) -> None:
         """Creates a training and test sets.
         
@@ -304,6 +315,8 @@ class Icentia11k:
         description["rhythm_class_proportion"] = np.round(description["rhythm_class_counts"] / description["num_frames"], 2)
         description["patient_ids"] = np.unique(ecg_data["patient"])
         return description
+    
+    # TODO: Summarize distribution of classes for all labelled patients 9,000 - 10,999
     
 if __name__ == "__main__":
     dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800, seed=2025)
