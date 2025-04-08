@@ -11,13 +11,16 @@ import logging
 from pathlib import Path
 import random
 import time
-from typing import Optional
+from typing import Optional, Self
+import urllib.error
 import urllib.request
 
 import pandas as pd
 import numpy as np
 import numpy.typing as npt
 import wfdb
+
+from ecg_classification.utils import cartesian
 
 log = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
@@ -144,50 +147,84 @@ class ECGLabelEncoder:
 
 @dataclass
 class ECGData:
+    """Stores ECG recordings"""
+
     frames: npt.NDArray
+    frame_number: npt.NDArray
     beat_classes: npt.NDArray
     rhythm_classes: npt.NDArray
     patient_ids: npt.NDArray
     segment_ids: npt.NDArray
 
-class TrainTestSplit:
-    pass
+    @classmethod
+    def from_npz(cls: Self, file: Path) -> Self:
+        """Creates an instance of ECGData from a npz file"""
+        d = np.load(file)
+        return cls(
+            frames=d["signal"], frame_number=d["frame_num"], beat_classes=d["beat"], rhythm_classes=d["rhythm"],
+            patient_ids=d["patient"], segment_ids=d["segment"]
+        )
 
-class Summarizer:
-    pass
+    def to_npz(self, file: Path) -> None:
+        """Saves ECGData to npz"""
+        np.savez_compressed(
+            file,
+            signal=self.frames,
+            frame_num=self.frame_number,
+            beat=self.beat_classes,
+            rhythm=self.rhythm_classes,
+            patient=self.patient_ids,
+            segment=self.segment_ids,
+        )
+
+    def combine(self, other: Self) -> Self:
+        """Combines two instances of ECGData into one"""
+        return ECGData(
+            frames=np.vstack([self.frames, other.frames]),
+            frame_number=np.hstack([self.frame_number, other.frame_number]),
+            beat_classes=np.vstack([self.beat_classes, other.beat_classes]),
+            rhythm_classes=np.vstack([self.rhythm_classes, other.rhythm_classes]),
+            patient_ids=np.hstack([self.patient_ids, other.patient_ids]),
+            segment_ids=np.hstack([self.segment_ids, other.segment_ids]),
+        )
 
 class Icentia11k:
     """Interface to work with the Icentia11k dataset"""
 
-    # Tan et al. 2019 remove labels patient ids < 9000. They keep labels for 'test set', i.e. patient id >= 9000
-    train_patient_ids = (9_000, 9_999)
-    test_patient_ids = (10_000, 10_999)
-    # TODO: Train/test split might be better as 0.7 train and 0.3 test
-    # TODO: Stratify splits by class distribution, not by patient id's
-
-    segment_id_range = (0, 49)
-
-    # TODO: Remove seed parameters, I wanna avoid any hidden random states
-    def __init__(self, dir: Path, frame_length: int, seed: int = 2025):
+    def __init__(self, dir: Path, frame_length: int):
         self.dir = dir
         self.download_manager = DownloadManager(output_dir=self.dir)
         self.ecg_encoder = ECGLabelEncoder()
         # Tan et al. 2019 used a frame length of 2^11 + 1 = 2049 (https://arxiv.org/pdf/1910.09570)
         self.frame_length = frame_length
 
-        self.rng = np.random.default_rng(seed=seed)
+    def create(self, patient_segments: npt.NDArray, overwrite: bool = False) -> None:
+        """
+        Args:
+            patient_segments - a 2D array; each row is a [patient, segment] pair
+            overwrite - whether or not to overwrite the local dataset file
+        """
 
-    def create(self, patient_ids: list[int], segments: list[int], overwrite: bool = False) -> None:
+        file = self.dir/"data.npz"
+        if not overwrite and file.exists():
+            ecg_data: ECGData = ECGData.from_npz(file)
 
-        if not overwrite:
-            # Open existing dataset and append
-            pass
+            # Filter patients and segments that already exist in the dataset
+            stored = set((patient, segment) for patient, segment in cartesian(np.unique(ecg_data.patient_ids), np.unique(ecg_data.segment_ids)))
+            query = set((patient, segment) for patient, segment in patient_segments)
+            patient_segments = np.array([[patient, segment] for patient, segment in query - stored])
 
-        # Get frames and labels
-        frames_and_labels = self.get_aggregate_frames_and_labels(patient_ids, segments)
+            # If there are patients and segments to add
+            if len(patient_segments) >= 1:
+                ecg_data = ecg_data.combine(self.get_aggregate_frames_and_labels(patient_segments))
+        else:
+            ecg_data = self.get_aggregate_frames_and_labels(patient_segments)
 
-        # Compute class distributions and save to ./summary.txt at the segment level
-        summary = self.summarize_dataset(frames_and_labels)
+        ecg_data.to_npz(file)
+
+        summary = self.summarize_dataset(ecg_data)
+        log.info(f"Dataset Summary\n{summary}")
+        summary.to_csv(self.dir/Path("summary.csv"))
 
     def is_valid_patient_segment_id(self, patient_id, segment: int) -> bool:
         """Checks if given patient and segment IDs are valid.
@@ -201,7 +238,7 @@ class Icentia11k:
         return 9_000 <= patient_id <= 10_999 and 0 <= segment <= 49
 
     def get_recording(self,
-            patient_id: int, segment: int,
+            patient_id: int, segment_id: int,
             start: int = 0, length: Optional[int] = None,
             download_if_missing: bool = True
         ) -> tuple[wfdb.Record | wfdb.MultiRecord, wfdb.Annotation]:
@@ -216,10 +253,13 @@ class Icentia11k:
             raise ValueError("Expected length greater than 0")
         if start < 0:
             raise ValueError("Expected start greater than or equal to 0")
+        
+        if not self.is_valid_patient_segment_id(patient_id, segment_id):
+            raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
 
-        segment_dir = self.download_manager.get_patient_folder_path(patient_id, segment)
+        segment_dir = self.download_manager.get_patient_folder_path(patient_id, segment_id)
         if not segment_dir.exists() and download_if_missing:
-            self.download_manager.fetch_patient_data(patient_id, segments=[segment])
+            self.download_manager.fetch_patient_data(patient_id, segments=[segment_id])
         segment_dir = str(segment_dir)
 
         rec: wfdb.Record | wfdb.MultiRecord
@@ -273,86 +313,36 @@ class Icentia11k:
 
         return ECGData(
             frames=signal_data,
+            frame_number=np.arange(n_frames),
             beat_classes=np.array(beat_classes, dtype=np.int8),
             rhythm_classes=np.array(rhythm_classes, dtype=np.int8),
             patient_ids=np.repeat(patient_id, n_frames),
-            segment_ids=np.repeat(segment_id, n_frames, np.int8),
+            segment_ids=np.repeat(segment_id, n_frames).astype(np.int8),
         )
     
-    def get_aggregate_frames_and_labels(self, patient_ids: list[int], segments: list[int]) -> ECGData:
+    def get_aggregate_frames_and_labels(self, patient_segments: npt.NDArray) -> ECGData:
         """Aggregate frames and labels for multiple patients and segments"""
-        if not segments:
-            raise ValueError("Expected at least one segment")
-        
-        frames = []
-        beat_classes = []
-        rhythm_classes = []
-        patients = []
-        segments = []
+        # Stack all the ECG data (frames + labels)
+        ecg_data = self.get_labelled_segment_frames(*patient_segments[0])
+        for patient, segment in patient_segments[1:]:
+            try:
+                ecg_data = ecg_data.combine(self.get_labelled_segment_frames(patient, segment))
+            except urllib.error.URLError as e:
+                print(e, f"for {patient}, {segment}")
+                continue
+        return ecg_data
 
-        for patient_id in patient_ids:
-            for seg in segments:
-                ecg_data = self.get_labelled_segment_frames(patient_id, seg)
-                frames.append(ecg_data.frames)
-                beat_classes.append(ecg_data.beat_classes)
-                rhythm_classes.append(ecg_data.rhythm_classes)
-                patients.append(ecg_data.patient_ids)
-                segments.append(ecg_data.segment_ids)
-
-        frames = np.vstack(frames)
-        beat_classes = np.vstack(beat_classes, dtype=np.int8)
-        rhythm_classes = np.vstack(rhythm_classes, dtype=np.int8)
-        patients = np.vstack(patients)
-        segments = np.vstack(segments)
-
-        return ECGData(frames, beat_classes, rhythm_classes, patients, segments)
-
-    # TODO: Swap with Scikit-Learn's StratifiedKFoldSplit
-    def _create_supervised_data_split(self, split_name: str, size: int, patient_id_range: tuple[int, int], segments: list[int]) -> None:
-        """Creates a split of ECG data"""
-        patient_ids = self.rng.integers(low=patient_id_range[0], high=patient_id_range[1]+1, size=size)
-        ecg_data = self.get_aggregate_frames_and_labels(patient_ids, segments)
-        np.savez_compressed(
-            self.dir/f"{split_name}.npz",
-            signal=np.expand_dims(ecg_data.frames, axis=-1),
-            rhythm=ecg_data.rhythm_classes,
-            beat=ecg_data.beat_classes,
-            patient=ecg_data.patient_ids,
-        )
-    
-    # TODO: Create train and test in a stratified manner ...
-    # TODO: Change train_size & test_size to accept proportions instead of absolute amounts
-    def create_supervised_train_test_data(self, train_size: int, test_size: int, segments: list[int]) -> None:
-        """Creates a training and test sets.
-        
-        To prevent data leakage, it's important that different patients are used for train and test sets.
-        
-        Args:
-            train_size - Number of patients to include in training set
-            test_size - Number of patients to include in test set
-            segments - id of specific segments to include, regardless of patient id
-        """
-        self._create_supervised_data_split("train", train_size, self.train_patient_ids, segments)
-        self._create_supervised_data_split("test", test_size, self.test_patient_ids, segments)
-
-    def summarize_dataset(self, ecg_data: dict[str, npt.NDArray]) -> pd.DataFrame:
+    def summarize_dataset(self, ecg_data: ECGData) -> pd.DataFrame:
         """Describes class distribution in npz file""" 
         df = pd.DataFrame({
-            "patient_id": ecg_data["patient"],
-            "segment_id": ecg_data["segment"],
-            "beat_normal": ecg_data["beat"][:, 0].T,
-            "beat_abnormal": ecg_data["beat"][:, 1].T,
-            "rhythm_normal": ecg_data["rhythm"][:, 0].T,
-            "rhythm_abnormal": ecg_data["rhythm"][:, 1].T,
+            "patient_id": ecg_data.patient_ids,
+            "segment_id": ecg_data.segment_ids,
+            "frame_number": ecg_data.frame_number,
+            "beat_normal": ecg_data.beat_classes[:, 0].T[0],
+            "beat_abnormal": ecg_data.beat_classes[:, 1].T[0],
+            "rhythm_normal": ecg_data.rhythm_classes[:, 0].T[0],
+            "rhythm_abnormal": ecg_data.rhythm_classes[:, 1].T[0],
         })
-        print(df)
-
-        # description["num_frames"] = ecg_data["signal"].shape[0]
-        # description["beat_class_counts"] = np.sum(ecg_data["beat"], axis=0)
-        # description["beat_class_proportion"] = np.round(description["beat_class_counts"] / description["num_frames"], 2)
-        # description["rhythm_class_counts"] = np.sum(ecg_data["rhythm"], axis=0)
-        # description["rhythm_class_proportion"] = np.round(description["rhythm_class_counts"] / description["num_frames"], 2)
-        # description["patient_ids"] = np.unique(ecg_data["patient"])
         return df
     
     # TODO: Summarize distribution of classes for all labelled patients 9,000 - 10,999
@@ -361,18 +351,18 @@ if __name__ == "__main__":
     rng = np.random.default_rng(seed=2025)
 
     dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800)
+
+    patient_ids = rng.integers(low=9_000, high=10_999+1, size=3)
+    segment_ids = rng.integers(low=0, high=49+1, size=3)
+    patient_segments = cartesian(patient_ids, segment_ids)
     
-    dataset.create(
-        patient_ids=rng.integers(low=9_000, high=10_999+1, size=3),
-        segments=rng.integers(low=0, high=49+1, size=1),
-        overwrite=False,
-    )
+    dataset.create(patient_segments, overwrite=False)
 
     # TODO: Rewrite the data loader so that it only stores:
     #   1. train.npz
     #   2. test.npz
-    #   3. metadata.csv
-    #   4. summary.txt
+    #   3. summary.csv
+    #   4. metadata.txt <- class labels
 
     # Each .npz file should contain an array of frames, beat labels, test labels, patient id, segment id
 

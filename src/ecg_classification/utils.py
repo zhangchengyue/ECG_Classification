@@ -9,9 +9,18 @@ import pandas as pd
 import sys,os
 import hashlib
 import pickle
-import os 
+import os
 
-import os 
+import os
+
+import numpy as np
+import numpy.typing as npt
+
+def cartesian(a: npt.NDArray, b: npt.NDArray) -> npt.NDArray:
+    """Returns the cartesian product of two 1d numpy arrays"""
+    return np.transpose([np.tile(a, len(b)), np.repeat(b, len(a))])
+
+
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
 def create_index(df, remove_meta=False):
