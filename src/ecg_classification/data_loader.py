@@ -324,3 +324,17 @@ if __name__ == "__main__":
 
     print("Train", dataset.describe_ecg_npz(dataset.dir/"train.npz"), end="\n\n")
     print("Test", dataset.describe_ecg_npz(dataset.dir/"test.npz"), end="\n\n")
+
+
+    # TODO: Rewrite the data loader so that it only stores:
+    #   1. train.npz
+    #   2. test.npz
+    #   3. metadata.csv
+    #   4. summary.txt
+
+    # Each .npz file should contain an array of frames, beat labels, test labels, patient id
+
+    # Every call to download another patient should NOT overwrite the train.npz/test.npz, but should append to it
+    #   (If you wish to cache previous versions of train and test, simply copy and rename the data/ folder and save it somewhere else)
+
+    
