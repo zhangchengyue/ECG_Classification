@@ -48,3 +48,12 @@ def test_rhythm_label_encoding():
     # Abnormal
     abnormal_rhythm_frame = np.array(['(N'] * 10 + ['(AFIB'])
     assert np.all(encoder.reclassify_rhythm_in_frame(abnormal_rhythm_frame) == np.array([0, 1]))
+
+def test_is_valid_patient_segment():
+    dataset = Icentia11k(dir=Path("./data/icentia11k"), frame_length=800)
+
+    assert dataset.is_valid_patient_segment_id(patient_id=9_000, segment=0), "Lower patient & segment bounds"
+    assert dataset.is_valid_patient_segment_id(patient_id=10_999, segment=49), "Upper patient & segment bounds"
+    assert not dataset.is_valid_patient_segment_id(patient_id=9_000, segment=50), "Invalid segment ID only"
+    assert not dataset.is_valid_patient_segment_id(patient_id=11_000, segment=3), "Invalid patient ID only"
+    assert not dataset.is_valid_patient_segment_id(patient_id=0, segment=100), "Invalid patient & segment ID"

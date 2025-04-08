@@ -148,6 +148,7 @@ class ECGData:
     beat_classes: npt.NDArray
     rhythm_classes: npt.NDArray
     patient_ids: npt.NDArray
+    segment_ids: npt.NDArray
 
 class TrainTestSplit:
     pass
@@ -164,7 +165,10 @@ class Icentia11k:
     # TODO: Train/test split might be better as 0.7 train and 0.3 test
     # TODO: Stratify splits by class distribution, not by patient id's
 
-    def __init__(self, dir: Path, frame_length: int, seed: int):
+    segment_id_range = (0, 49)
+
+    # TODO: Remove seed parameters, I wanna avoid any hidden random states
+    def __init__(self, dir: Path, frame_length: int, seed: int = 2025):
         self.dir = dir
         self.download_manager = DownloadManager(output_dir=self.dir)
         self.ecg_encoder = ECGLabelEncoder()
@@ -172,6 +176,29 @@ class Icentia11k:
         self.frame_length = frame_length
 
         self.rng = np.random.default_rng(seed=seed)
+
+    def create(self, patient_ids: list[int], segments: list[int], overwrite: bool = False) -> None:
+
+        if not overwrite:
+            # Open existing dataset and append
+            pass
+
+        # Get frames and labels
+        frames_and_labels = self.get_aggregate_frames_and_labels(patient_ids, segments)
+
+        # Compute class distributions and save to ./summary.txt at the segment level
+        summary = self.summarize_dataset(frames_and_labels)
+
+    def is_valid_patient_segment_id(self, patient_id, segment: int) -> bool:
+        """Checks if given patient and segment IDs are valid.
+        
+        Patient IDs should be in [9_000, 10_999],
+            which corresponds to the fully-labelled ECG recordings from Tan et al. 2019.
+        Segment IDs should be in [0, 49] because each patient has only 50 ~70min segments of ECG recordings.
+
+        Refer to Tan et al. 2019 (https://www.cinc.org/2021/Program/accepted/229_Preprint.pdf) for details.
+        """
+        return 9_000 <= patient_id <= 10_999 and 0 <= segment <= 49
 
     def get_recording(self,
             patient_id: int, segment: int,
@@ -204,14 +231,16 @@ class Icentia11k:
             ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
         return rec, ann
         
-    def get_frames_and_labels(self, patient_id: int, segment: int) -> ECGData:
+    def get_labelled_segment_frames(self, patient_id: int, segment_id: int) -> ECGData:
         """Returns frames of ECG signal, and the corresponding beat and rhythm labels per frame
         
         Example, frame 1 contains only Normal beats, with Normal Sinusal Rhythms
         Example, frame 2 contains a Premature Atrial Contraction, with Atrial Fibrillation rhythm
         """
+        if not self.is_valid_patient_segment_id(patient_id, segment_id):
+            raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
 
-        rec, ann = self.get_recording(patient_id, segment)
+        rec, ann = self.get_recording(patient_id, segment_id)
 
         # Chunk the signal into frames
         signal_data: npt.NDArray = rec.p_signal
@@ -247,6 +276,7 @@ class Icentia11k:
             beat_classes=np.array(beat_classes, dtype=np.int8),
             rhythm_classes=np.array(rhythm_classes, dtype=np.int8),
             patient_ids=np.repeat(patient_id, n_frames),
+            segment_ids=np.repeat(segment_id, n_frames, np.int8),
         )
     
     def get_aggregate_frames_and_labels(self, patient_ids: list[int], segments: list[int]) -> ECGData:
@@ -258,21 +288,24 @@ class Icentia11k:
         beat_classes = []
         rhythm_classes = []
         patients = []
+        segments = []
 
         for patient_id in patient_ids:
             for seg in segments:
-                ecg_data = self.get_frames_and_labels(patient_id, seg)
+                ecg_data = self.get_labelled_segment_frames(patient_id, seg)
                 frames.append(ecg_data.frames)
                 beat_classes.append(ecg_data.beat_classes)
                 rhythm_classes.append(ecg_data.rhythm_classes)
                 patients.append(ecg_data.patient_ids)
+                segments.append(ecg_data.segment_ids)
 
         frames = np.vstack(frames)
         beat_classes = np.vstack(beat_classes, dtype=np.int8)
         rhythm_classes = np.vstack(rhythm_classes, dtype=np.int8)
         patients = np.vstack(patients)
+        segments = np.vstack(segments)
 
-        return ECGData(frames, beat_classes, rhythm_classes, patients)
+        return ECGData(frames, beat_classes, rhythm_classes, patients, segments)
 
     # TODO: Swap with Scikit-Learn's StratifiedKFoldSplit
     def _create_supervised_data_split(self, split_name: str, size: int, patient_id_range: tuple[int, int], segments: list[int]) -> None:
@@ -302,29 +335,38 @@ class Icentia11k:
         self._create_supervised_data_split("train", train_size, self.train_patient_ids, segments)
         self._create_supervised_data_split("test", test_size, self.test_patient_ids, segments)
 
-    def describe_ecg_npz(self, npz_ecg_data: Path) -> dict[str, int]:
-        """Describes class distribution in npz file"""
-        ecg_data = np.load(npz_ecg_data)
+    def summarize_dataset(self, ecg_data: dict[str, npt.NDArray]) -> pd.DataFrame:
+        """Describes class distribution in npz file""" 
+        df = pd.DataFrame({
+            "patient_id": ecg_data["patient"],
+            "segment_id": ecg_data["segment"],
+            "beat_normal": ecg_data["beat"][:, 0].T,
+            "beat_abnormal": ecg_data["beat"][:, 1].T,
+            "rhythm_normal": ecg_data["rhythm"][:, 0].T,
+            "rhythm_abnormal": ecg_data["rhythm"][:, 1].T,
+        })
+        print(df)
 
-        description = {}
-
-        description["num_frames"] = ecg_data["signal"].shape[0]
-        description["beat_class_counts"] = np.sum(ecg_data["beat"], axis=0)
-        description["beat_class_proportion"] = np.round(description["beat_class_counts"] / description["num_frames"], 2)
-        description["rhythm_class_counts"] = np.sum(ecg_data["rhythm"], axis=0)
-        description["rhythm_class_proportion"] = np.round(description["rhythm_class_counts"] / description["num_frames"], 2)
-        description["patient_ids"] = np.unique(ecg_data["patient"])
-        return description
+        # description["num_frames"] = ecg_data["signal"].shape[0]
+        # description["beat_class_counts"] = np.sum(ecg_data["beat"], axis=0)
+        # description["beat_class_proportion"] = np.round(description["beat_class_counts"] / description["num_frames"], 2)
+        # description["rhythm_class_counts"] = np.sum(ecg_data["rhythm"], axis=0)
+        # description["rhythm_class_proportion"] = np.round(description["rhythm_class_counts"] / description["num_frames"], 2)
+        # description["patient_ids"] = np.unique(ecg_data["patient"])
+        return df
     
     # TODO: Summarize distribution of classes for all labelled patients 9,000 - 10,999
     
 if __name__ == "__main__":
-    dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800, seed=2025)
-    dataset.create_supervised_train_test_data(train_size=5, test_size=5, segments=[0, 37]) # 0 & 37 are arbitrary
+    rng = np.random.default_rng(seed=2025)
 
-    print("Train", dataset.describe_ecg_npz(dataset.dir/"train.npz"), end="\n\n")
-    print("Test", dataset.describe_ecg_npz(dataset.dir/"test.npz"), end="\n\n")
-
+    dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800)
+    
+    dataset.create(
+        patient_ids=rng.integers(low=9_000, high=10_999+1, size=3),
+        segments=rng.integers(low=0, high=49+1, size=1),
+        overwrite=False,
+    )
 
     # TODO: Rewrite the data loader so that it only stores:
     #   1. train.npz
@@ -332,9 +374,9 @@ if __name__ == "__main__":
     #   3. metadata.csv
     #   4. summary.txt
 
-    # Each .npz file should contain an array of frames, beat labels, test labels, patient id
+    # Each .npz file should contain an array of frames, beat labels, test labels, patient id, segment id
 
     # Every call to download another patient should NOT overwrite the train.npz/test.npz, but should append to it
     #   (If you wish to cache previous versions of train and test, simply copy and rename the data/ folder and save it somewhere else)
 
-    
+
