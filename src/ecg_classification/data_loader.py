@@ -26,6 +26,10 @@ from ecg_classification.utils import cartesian
 log = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
 
+class MissingECGSegmentError(Exception):
+    """When a patient segment is missing from the dataset"""
+    pass
+
 
 class DownloadManager:
     """Manages downloads for dataset"""
@@ -38,23 +42,27 @@ class DownloadManager:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # TODO: Save multiple segments belonging to one patient in the same p#####.tar.gz
     def fetch_patient_segment(self, patient_id: int, segment_id: int) -> None:
         """Fetches patient data from Icentia11k dataset.
         
         The data is hosted at PhysioNet, here: https://physionet.org/files/icentia11k-continuous-ecg/1.0
         Refer to Tan et al. https://arxiv.org/pdf/1910.09570 for more information.
+
+        If the patient segment doesn't exist, then this doesn't fetch anything and raises an error.
+
+        Raises:
+            MissingSegmentError
         """
 
         patient_folder = f"p{patient_id:05d}"
         patient_folder_url = self._get_patient_folder_url(patient_folder)
 
-        # Check if already downloaded
-        if (self.output_dir/f"{patient_folder}.tar.gz").exists():
-            log.info(f"{patient_folder} already fetched")
-            return
-
         write_path = self.output_dir/patient_folder
         write_path.mkdir(parents=True, exist_ok=True)
+
+        if self.is_patient_segment_stored_locally(patient_id, segment_id):
+            return
 
         # Define file urls to fetch
         files_to_download: list[Path] = []
@@ -64,23 +72,37 @@ class DownloadManager:
         # Download files
         for file in files_to_download:
             try:
+                # This check is a little redundant, but in the future I might want to consider re-requesting as needed
+                if file.exists():
+                    log.info(f"{file.name} already fetched")
+                    continue
                 self.download_file(
                     f"{patient_folder_url}/{file}",
                     write_path/file
                 )
             except urllib.error.URLError as e:
-                log.error(f"{e}. Could not download {file}")
-                continue
+                # Remove the whole segment - it could be the case that 2/3 files were successfully downloaded,
+                #   but in that case we throw out the whole segment as unusable
+                for file in write_path.iterdir():
+                    if file.is_file():
+                        file.unlink()
+                write_path.rmdir()
+                raise MissingECGSegmentError(f"Could not obtain p{patient_id:05d}_s{segment_id:02d}")
+            
+        # Have other segments for this patient been downloaded too? 
+        #   If so, extract those so they can be included in the archive too
+        #   We do this because there is no way to open the tar.gz in append mode, only read or (over)write
+        if self.get_patient_tar_gz_path(patient_id).exists():
+            with tarfile.open(self.get_patient_tar_gz_path(patient_id), "r:gz") as tar:
+                tar.extractall()
 
         # Archive & compress
-        with tarfile.open(self.get_tar_gz_path(patient_id, segment_id), "w:gz") as tar:
+        with tarfile.open(self.get_patient_tar_gz_path(patient_id), "w:gz") as tar:
             tar.add(write_path)
 
-        # Remove files
-        for file in files_to_download:
-            if not (write_path/file).exists():
-                continue
-            (write_path/file).unlink()
+        # Remove uncompressed files
+        for file in write_path.iterdir():
+            file.unlink()
         write_path.rmdir()
 
     def download_file(self, url: str, out: Path, sleep: int = 3) -> bytes:
@@ -93,12 +115,25 @@ class DownloadManager:
             out.write_bytes(contents)
         time.sleep(sleep)
 
+    def is_patient_segment_stored_locally(self, patient_id: int, segment_id: int) -> bool:
+        """Checks if patient segment has already been downloaded"""
+        patient_folder = f"p{patient_id:05d}" # TODO: Replace with some call to self.get_patient_folder()
+        if not self.get_patient_tar_gz_path(patient_id).exists():
+            return False
+        
+        write_path = self.output_dir/patient_folder
+        with tarfile.open(self.get_patient_tar_gz_path(patient_id), "r:gz") as tar:
+            for ext in self.ECG_FILE_EXTENSIONS:
+                file = write_path/f"{patient_folder}_s{segment_id:02d}.{ext}"
+                if str(file) in tar.getnames():
+                    return True
+        return False
 
     def _get_patient_folder_url(self, patient_folder: str) -> str:
         return "/".join([self.DATASET_URL, patient_folder[:3], patient_folder])
     
     def get_patient_folder_path(self, patient_id: int, segment_id: int) -> Path:
-        """Gets local path to patient ECG recording
+        """Gets local path to patient segment ECG recording
         
         Naming convention for folders is the same as in PhysioNet
         """
@@ -106,9 +141,9 @@ class DownloadManager:
         path = self.output_dir/Path(patient_folder, f"{patient_folder}_s{segment_id:02d}")
         return path
     
-    def get_tar_gz_path(self, patient_id: int, segment_id: int) -> Path:
+    def get_patient_tar_gz_path(self, patient_id: int) -> Path:
         patient_folder = f"p{patient_id:05d}"
-        return self.output_dir/f"{patient_folder}_{segment_id:02d}.tar.gz"
+        return self.output_dir/f"{patient_folder}.tar.gz"
 
 class ECGLabelEncoder:
     """Encodes labels for ECG recordings"""
@@ -174,7 +209,15 @@ class ECGData:
     segment_ids: npt.NDArray
 
     @classmethod
-    def from_npz(cls: Self, file: Path) -> Self:
+    def new_empty(cls: Self) -> 'ECGData':
+        """Creates empty ECGData. Instead of initializing `None` for a variable
+        intended to potentially hold ECGData, you should use this method to preserve the type."""
+        return cls(frames=np.array([]), frame_number=np.array([]),
+            beat_classes=np.array([]), rhythm_classes=np.array([]),
+            patient_ids=np.array([]), segment_ids=np.array([]))
+
+    @classmethod
+    def from_npz(cls: Self, file: Path) -> 'ECGData':
         """Creates an instance of ECGData from a npz file"""
         d = np.load(file)
         return cls(
@@ -196,6 +239,13 @@ class ECGData:
 
     def combine(self, other: Self) -> Self:
         """Combines two instances of ECGData into one"""
+        if self.is_empty() and not other.is_empty():
+            return other
+        elif not self.is_empty() and other.is_empty():
+            return self
+        elif self.is_empty() and other.is_empty():
+            # Do I need to create a new empty object? Could I just return self? Not really important tho
+            return ECGData.new_empty()
         return ECGData(
             frames=np.vstack([self.frames, other.frames]),
             frame_number=np.hstack([self.frame_number, other.frame_number]),
@@ -204,6 +254,10 @@ class ECGData:
             patient_ids=np.hstack([self.patient_ids, other.patient_ids]),
             segment_ids=np.hstack([self.segment_ids, other.segment_ids]),
         )
+    
+    def is_empty(self) -> bool:
+        props = [self.frames, self.frame_number, self.beat_classes, self.rhythm_classes, self.patient_ids, self.segment_ids]
+        return all(p.size == 0 for p in props)
 
 class Icentia11k:
     """Interface to work with the Icentia11k dataset"""
@@ -237,11 +291,13 @@ class Icentia11k:
         else:
             ecg_data = self.get_aggregate_frames_and_labels(patient_segments)
 
-        ecg_data.to_npz(file)
-
-        summary = self.summarize_dataset(ecg_data)
-        log.info(f"Dataset Summary\n{summary}")
-        summary.to_parquet(self.dir/Path("summary.parquet.gzip"), compression="gzip")
+        if not ecg_data.is_empty():
+            ecg_data.to_npz(file)
+            summary = self.summarize_dataset(ecg_data)
+            log.info(f"Dataset Summary\n{summary}")
+            summary.to_parquet(self.dir/Path("summary.parquet.gzip"), compression="gzip")
+        else:
+            log.info("ECG data was empty")
 
     def is_valid_patient_segment_id(self, patient_id, segment: int) -> bool:
         """Checks if given patient and segment IDs are valid.
@@ -274,15 +330,15 @@ class Icentia11k:
         if not self.is_valid_patient_segment_id(patient_id, segment_id):
             raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
 
-        if not self.download_manager.get_tar_gz_path(patient_id, segment_id).exists() and download_if_missing:
+        if not self.download_manager.is_patient_segment_stored_locally(patient_id, segment_id) and download_if_missing:
             self.download_manager.fetch_patient_segment(patient_id, segment_id)
 
         segment_dir = str(self.download_manager.get_patient_folder_path(patient_id, segment_id))
         
-        with tarfile.open(self.download_manager.get_tar_gz_path(patient_id, segment_id), "r:gz") as tar:
+        # TODO: Consider converting this open tar + remove extracted files to a decorator
+        with tarfile.open(self.download_manager.get_patient_tar_gz_path(patient_id), "r:gz") as tar:
             tar.extractall()
 
-            log.debug(segment_dir)
             rec: wfdb.Record | wfdb.MultiRecord
             if not length:
                 rec = wfdb.rdrecord(segment_dir)
@@ -350,13 +406,18 @@ class Icentia11k:
     def get_aggregate_frames_and_labels(self, patient_segments: npt.NDArray) -> ECGData:
         """Aggregate frames and labels for multiple patients and segments"""
         # Stack all the ECG data (frames + labels)
-        ecg_data = self.get_labelled_segment_frames(*patient_segments[0])
-        for patient, segment in patient_segments[1:]:
-            ecg_data = ecg_data.combine(self.get_labelled_segment_frames(patient, segment))
+        ecg_data: ECGData = ECGData.new_empty()
+        for patient, segment in patient_segments:
+            try:
+                d = self.get_labelled_segment_frames(patient, segment)
+                ecg_data = ecg_data.combine(d)
+            except MissingECGSegmentError as e:
+                log.error(e)
+                continue
         return ecg_data
 
     def summarize_dataset(self, ecg_data: ECGData) -> pd.DataFrame:
-        """Describes class distribution in npz file""" 
+        """Describes class distribution in npz file"""
         df = pd.DataFrame({
             "patient_id": ecg_data.patient_ids,
             "segment_id": ecg_data.segment_ids,
@@ -369,12 +430,15 @@ class Icentia11k:
         return df
     
 if __name__ == "__main__":
-    rng = np.random.default_rng(seed=1234)
+    rng = np.random.default_rng(seed=2025)
 
     dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800)
 
-    patient_ids = rng.integers(low=9_000, high=10_999+1, size=3)
-    segment_ids = rng.integers(low=0, high=29+1, size=1)
-    patient_segments = cartesian(patient_ids, segment_ids)
+    patient_ids = rng.integers(low=9_000, high=10_999+1, size=2)
+    segment_ids = rng.integers(low=0, high=49+1, size=1)
+    # patient_segments = cartesian(patient_ids, segment_ids)
+    patient_segments = np.array([[9849, 22], [9849, 11], [9849, 14], [9850, 22], [9849, 49], [9894, 49]])
     
     dataset.create(patient_segments, overwrite=False)
+
+    # 2. Adjust downloads so segments from one patient get archived all together

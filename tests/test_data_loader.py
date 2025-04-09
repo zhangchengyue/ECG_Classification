@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ecg_classification.data_loader import ECGLabelEncoder, Icentia11k
+from ecg_classification.data_loader import ECGLabelEncoder, Icentia11k, DownloadManager, ECGData
 
 
 def test_encode_presence_absence():
@@ -57,3 +57,30 @@ def test_is_valid_patient_segment():
     assert not dataset.is_valid_patient_segment_id(patient_id=9_000, segment=50), "Invalid segment ID only"
     assert not dataset.is_valid_patient_segment_id(patient_id=11_000, segment=3), "Invalid patient ID only"
     assert not dataset.is_valid_patient_segment_id(patient_id=0, segment=100), "Invalid patient & segment ID"
+
+def test_download_files_does_not_write_file_on_url_error():
+    import urllib
+    
+    downloader = DownloadManager(Path("./data/icentia11k"))
+    file = downloader.output_dir/Path("out.txt")
+
+    with pytest.raises(urllib.error.URLError):
+        downloader.download_file("https://unreachable.gov", file)
+
+    assert not file.exists()
+
+def test_empty_ecgdata_is_empty():
+    data: ECGData = ECGData.new_empty()
+    assert data.is_empty()
+
+    a = np.array([1,2,3])
+    data = ECGData(a, a, a, a, a, a)
+    assert not data.is_empty()
+
+def test_combine_ecg_data_with_empty_data():
+    data_1: ECGData = ECGData.new_empty()
+    a = np.array([1,2,3])
+    data_2 = ECGData(a, a, a, a, a, a)
+
+    assert data_1.combine(data_2) == data_2
+    assert data_2.combine(data_1) == data_2
