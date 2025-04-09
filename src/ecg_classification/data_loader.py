@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import time
 from typing import Optional, Self
+import tarfile
 import urllib.error
 import urllib.request
 
@@ -37,39 +38,50 @@ class DownloadManager:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def fetch_patient_data(self, patient_id: int, segments: Optional[list[int]] = None, n_rand_segments: Optional[int] = None) -> None:
-        """Fetches patient data from Icentia11k dataset
+    def fetch_patient_segment(self, patient_id: int, segment_id: int) -> None:
+        """Fetches patient data from Icentia11k dataset.
         
-        The data is hosted at PhysioNet (https://physionet.org/files/icentia11k-continuous-ecg/1.0)
+        The data is hosted at PhysioNet, here: https://physionet.org/files/icentia11k-continuous-ecg/1.0
         Refer to Tan et al. https://arxiv.org/pdf/1910.09570 for more information.
         """
 
         patient_folder = f"p{patient_id:05d}"
         patient_folder_url = self._get_patient_folder_url(patient_folder)
 
+        # Check if already downloaded
+        if (self.output_dir/f"{patient_folder}.tar.gz").exists():
+            log.info(f"{patient_folder} already fetched")
+            return
+
         write_path = self.output_dir/patient_folder
         write_path.mkdir(parents=True, exist_ok=True)
 
-        # Define segments to fetch
-        if n_rand_segments:
-            segments = [random.randint(0, self.TOTAL_SEGMENTS - 1) for _ in range(n_rand_segments)]
-        assert segments, "Segments cannot be None. Either set `segments` or `n_rand_segments`"
-
         # Define file urls to fetch
         files_to_download: list[Path] = []
-        for seg in segments:
-            for ext in self.ECG_FILE_EXTENSIONS:
-                files_to_download.append(Path(f"{patient_folder}_s{seg:02d}.{ext}"))
+        for ext in self.ECG_FILE_EXTENSIONS:
+            files_to_download.append(Path(f"{patient_folder}_s{segment_id:02d}.{ext}"))
 
         # Download files
         for file in files_to_download:
-            if (write_path/file).exists():
-                log.info(f"{file} already fetched")
+            try:
+                self.download_file(
+                    f"{patient_folder_url}/{file}",
+                    write_path/file
+                )
+            except urllib.error.URLError as e:
+                log.error(f"{e}. Could not download {file}")
                 continue
-            self.download_file(
-                f"{patient_folder_url}/{file}",
-                write_path/file
-            )
+
+        # Archive & compress
+        with tarfile.open(self.get_tar_gz_path(patient_id, segment_id), "w:gz") as tar:
+            tar.add(write_path)
+
+        # Remove files
+        for file in files_to_download:
+            if not (write_path/file).exists():
+                continue
+            (write_path/file).unlink()
+        write_path.rmdir()
 
     def download_file(self, url: str, out: Path, sleep: int = 3) -> bytes:
         """Downloads a file using HTTPS.
@@ -81,17 +93,22 @@ class DownloadManager:
             out.write_bytes(contents)
         time.sleep(sleep)
 
+
     def _get_patient_folder_url(self, patient_folder: str) -> str:
         return "/".join([self.DATASET_URL, patient_folder[:3], patient_folder])
     
-    def get_patient_folder_path(self, patient_id: int, segment: int) -> Path:
+    def get_patient_folder_path(self, patient_id: int, segment_id: int) -> Path:
         """Gets local path to patient ECG recording
         
         Naming convention for folders is the same as in PhysioNet
         """
         patient_folder = f"p{patient_id:05d}"
-        path = self.output_dir/Path(patient_folder, f"{patient_folder}_s{segment:02d}")
+        path = self.output_dir/Path(patient_folder, f"{patient_folder}_s{segment_id:02d}")
         return path
+    
+    def get_tar_gz_path(self, patient_id: int, segment_id: int) -> Path:
+        patient_folder = f"p{patient_id:05d}"
+        return self.output_dir/f"{patient_folder}_{segment_id:02d}.tar.gz"
 
 class ECGLabelEncoder:
     """Encodes labels for ECG recordings"""
@@ -224,7 +241,7 @@ class Icentia11k:
 
         summary = self.summarize_dataset(ecg_data)
         log.info(f"Dataset Summary\n{summary}")
-        summary.to_csv(self.dir/Path("summary.csv"))
+        summary.to_parquet(self.dir/Path("summary.parquet.gzip"), compression="gzip")
 
     def is_valid_patient_segment_id(self, patient_id, segment: int) -> bool:
         """Checks if given patient and segment IDs are valid.
@@ -257,18 +274,28 @@ class Icentia11k:
         if not self.is_valid_patient_segment_id(patient_id, segment_id):
             raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
 
-        segment_dir = self.download_manager.get_patient_folder_path(patient_id, segment_id)
-        if not segment_dir.exists() and download_if_missing:
-            self.download_manager.fetch_patient_data(patient_id, segments=[segment_id])
-        segment_dir = str(segment_dir)
+        if not self.download_manager.get_tar_gz_path(patient_id, segment_id).exists() and download_if_missing:
+            self.download_manager.fetch_patient_segment(patient_id, segment_id)
 
-        rec: wfdb.Record | wfdb.MultiRecord
-        if not length:
-            rec = wfdb.rdrecord(segment_dir)
-            ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, shift_samps=True)
-        else:
-            rec = wfdb.rdrecord(segment_dir, sampfrom=start, sampto=start+length)
-            ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
+        segment_dir = str(self.download_manager.get_patient_folder_path(patient_id, segment_id))
+        
+        with tarfile.open(self.download_manager.get_tar_gz_path(patient_id, segment_id), "r:gz") as tar:
+            tar.extractall()
+
+            log.debug(segment_dir)
+            rec: wfdb.Record | wfdb.MultiRecord
+            if not length:
+                rec = wfdb.rdrecord(segment_dir)
+                ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, shift_samps=True)
+            else:
+                rec = wfdb.rdrecord(segment_dir, sampfrom=start, sampto=start+length)
+                ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
+
+            for tarinfo in tar:
+                if tarinfo.isreg():
+                    Path(tarinfo.path).unlink()
+            self.download_manager.get_patient_folder_path(patient_id, segment_id).parent.rmdir()
+
         return rec, ann
         
     def get_labelled_segment_frames(self, patient_id: int, segment_id: int) -> ECGData:
@@ -325,11 +352,7 @@ class Icentia11k:
         # Stack all the ECG data (frames + labels)
         ecg_data = self.get_labelled_segment_frames(*patient_segments[0])
         for patient, segment in patient_segments[1:]:
-            try:
-                ecg_data = ecg_data.combine(self.get_labelled_segment_frames(patient, segment))
-            except urllib.error.URLError as e:
-                print(e, f"for {patient}, {segment}")
-                continue
+            ecg_data = ecg_data.combine(self.get_labelled_segment_frames(patient, segment))
         return ecg_data
 
     def summarize_dataset(self, ecg_data: ECGData) -> pd.DataFrame:
@@ -345,28 +368,13 @@ class Icentia11k:
         })
         return df
     
-    # TODO: Summarize distribution of classes for all labelled patients 9,000 - 10,999
-    
 if __name__ == "__main__":
-    rng = np.random.default_rng(seed=2025)
+    rng = np.random.default_rng(seed=1234)
 
     dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800)
 
     patient_ids = rng.integers(low=9_000, high=10_999+1, size=3)
-    segment_ids = rng.integers(low=0, high=49+1, size=3)
+    segment_ids = rng.integers(low=0, high=29+1, size=1)
     patient_segments = cartesian(patient_ids, segment_ids)
     
     dataset.create(patient_segments, overwrite=False)
-
-    # TODO: Rewrite the data loader so that it only stores:
-    #   1. train.npz
-    #   2. test.npz
-    #   3. summary.csv
-    #   4. metadata.txt <- class labels
-
-    # Each .npz file should contain an array of frames, beat labels, test labels, patient id, segment id
-
-    # Every call to download another patient should NOT overwrite the train.npz/test.npz, but should append to it
-    #   (If you wish to cache previous versions of train and test, simply copy and rename the data/ folder and save it somewhere else)
-
-

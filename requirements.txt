@@ -8,7 +8,7 @@ contourpy==1.3.1
 cycler==0.12.1
 debugpy==1.8.13
 decorator==5.2.1
--e git+https://github.com/zhangchengyue/ECG_Classification.git@470edf0b5fb198d7736f9a4e61aef6de39b9eb56#egg=ecg_classification
+-e git+https://github.com/zhangchengyue/ECG_Classification.git@2ba2414fca8364c41276f4dac7e3cde8330994b0#egg=ecg_classification
 executing==2.2.0
 filelock==3.13.1
 fonttools==4.56.0
@@ -49,6 +49,7 @@ prompt_toolkit==3.0.50
 psutil==7.0.0
 ptyprocess==0.7.0
 pure_eval==0.2.3
+pyarrow==19.0.1
 pycparser==2.22
 Pygments==2.19.1
 pyparsing==3.2.3
