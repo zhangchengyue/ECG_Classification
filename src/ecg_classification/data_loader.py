@@ -429,6 +429,18 @@ class Icentia11k:
         })
         return df
     
+    def print_summary(self) -> None:
+        df = pd.read_parquet(self.dir/"summary.parquet.gzip")
+
+        print("\nDataset Summary\n-------")
+        # Patients
+        print(df["patient_id"].nunique(), "patients")
+        # Segments & Frames
+        print(df["segment_id"].nunique(), "segments,", len(df), "frames\n")
+        # Class distribution
+        print("Class distribution (%)\n---------")
+        print((df[["beat_normal", "beat_abnormal", "rhythm_normal", "rhythm_abnormal"]].sum() / len(df)) * 100.0)
+
 if __name__ == "__main__":
     rng = np.random.default_rng(seed=2025)
 
@@ -440,5 +452,4 @@ if __name__ == "__main__":
     patient_segments = np.array([[9849, 22], [9849, 11], [9849, 14], [9850, 22], [9849, 49], [9894, 49]])
     
     dataset.create(patient_segments, overwrite=False)
-
-    # 2. Adjust downloads so segments from one patient get archived all together
+    dataset.print_summary()
