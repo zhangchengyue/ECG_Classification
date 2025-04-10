@@ -24,7 +24,7 @@ import wfdb
 from ecg_classification.utils import cartesian
 
 log = logging.getLogger()
-logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s - %(message)s")
 
 class MissingECGSegmentError(Exception):
     """When a patient segment is missing from the dataset"""
@@ -294,7 +294,6 @@ class Icentia11k:
         if not ecg_data.is_empty():
             ecg_data.to_npz(file)
             summary = self.summarize_dataset(ecg_data)
-            log.info(f"Dataset Summary\n{summary}")
             summary.to_parquet(self.dir/Path("summary.parquet.gzip"), compression="gzip")
         else:
             log.info("ECG data was empty")
@@ -308,7 +307,7 @@ class Icentia11k:
 
         Refer to Tan et al. 2019 (https://www.cinc.org/2021/Program/accepted/229_Preprint.pdf) for details.
         """
-        return 9_000 <= patient_id <= 10_999 and 0 <= segment <= 49
+        return 0 <= patient_id <= 10_999 and 0 <= segment <= 49
 
     def get_recording(self,
             patient_id: int, segment_id: int,
@@ -422,10 +421,10 @@ class Icentia11k:
             "patient_id": ecg_data.patient_ids,
             "segment_id": ecg_data.segment_ids,
             "frame_number": ecg_data.frame_number,
-            "beat_normal": ecg_data.beat_classes[:, 0].T[0],
-            "beat_abnormal": ecg_data.beat_classes[:, 1].T[0],
-            "rhythm_normal": ecg_data.rhythm_classes[:, 0].T[0],
-            "rhythm_abnormal": ecg_data.rhythm_classes[:, 1].T[0],
+            "beat_normal": ecg_data.beat_classes[:, 0],
+            "beat_abnormal": ecg_data.beat_classes[:, 1],
+            "rhythm_normal": ecg_data.rhythm_classes[:, 0],
+            "rhythm_abnormal": ecg_data.rhythm_classes[:, 1],
         })
         return df
     
@@ -448,8 +447,13 @@ if __name__ == "__main__":
 
     patient_ids = rng.integers(low=9_000, high=10_999+1, size=2)
     segment_ids = rng.integers(low=0, high=49+1, size=1)
-    # patient_segments = cartesian(patient_ids, segment_ids)
-    patient_segments = np.array([[9849, 22], [9849, 11], [9849, 14], [9850, 22], [9849, 49], [9894, 49]])
+    patient_segments = cartesian(patient_ids, segment_ids)
+    # patient_segments = np.array([[9849, 22], [9849, 11], [9849, 14], [9850, 22], [9849, 49], [9894, 49]]) # - some specific examples
     
     dataset.create(patient_segments, overwrite=False)
     dataset.print_summary()
+
+    # TODO: There's no reason for the beat labels and the rhythm labels to be np.array's ... just make them 0/1
+    #   that should save at least a few MB.
+    #   The initial reason for having the arrays was to enable multi-label classification (since a frame could realistically contain BOTH normal and abnormal beats and rhythms)
+    #   However, this is a more difficult problem that we didn't want to tackle just yet
