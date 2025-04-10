@@ -146,7 +146,7 @@ class ECGLabelEncoder:
                 encoded[categories[c]] = 1
         return encoded
 
-    def reclassify_beats_in_frame(self, frame_labels: npt.NDArray) -> npt.NDArray:
+    def reclassify_beats_in_frame(self, frame_labels: npt.NDArray) -> int:
         """Returns beat classification for a frame.
         
         A given frame contains either all Normal beats, or at least one Abnormal beat.
@@ -157,9 +157,9 @@ class ECGLabelEncoder:
         encoding = self.encode_presence_absence(frame_labels, self.beat_categories)
         # Remember, first element in categories is normal, rest are subtypes of abnormal beats
         has_abnormal_beats = np.bitwise_xor.reduce(encoding[1:])
-        return np.array([int(not has_abnormal_beats), has_abnormal_beats])
+        return has_abnormal_beats
         
-    def reclassify_rhythm_in_frame(self, frame_labels: npt.NDArray) -> npt.NDArray:
+    def reclassify_rhythm_in_frame(self, frame_labels: npt.NDArray) -> int:
         """Returns rhythm classification for a frame.
         
         A given frame contains either all Normal beats, or at least one Abnormal beat.
@@ -170,7 +170,7 @@ class ECGLabelEncoder:
         encoding = self.encode_presence_absence(frame_labels, self.rhythm_categories)
         # Remember, first element in categories is normal, rest are subtypes of abnormal rhythms
         has_abnormal_rhythm = np.bitwise_xor.reduce(encoding[1:])
-        return np.array([int(not has_abnormal_rhythm), has_abnormal_rhythm])
+        return has_abnormal_rhythm
 
 @dataclass
 class ECGData:
@@ -224,15 +224,30 @@ class ECGData:
         return ECGData(
             frames=np.vstack([self.frames, other.frames]),
             frame_number=np.hstack([self.frame_number, other.frame_number]),
-            beat_classes=np.vstack([self.beat_classes, other.beat_classes]),
-            rhythm_classes=np.vstack([self.rhythm_classes, other.rhythm_classes]),
+            beat_classes=np.hstack([self.beat_classes, other.beat_classes]),
+            rhythm_classes=np.hstack([self.rhythm_classes, other.rhythm_classes]),
             patient_ids=np.hstack([self.patient_ids, other.patient_ids]),
             segment_ids=np.hstack([self.segment_ids, other.segment_ids]),
         )
     
+    def _get_arrays(self) -> list[npt.NDArray]:
+        return [self.frames, self.frame_number, self.beat_classes, self.rhythm_classes, self.patient_ids, self.segment_ids]
+    
     def is_empty(self) -> bool:
-        props = [self.frames, self.frame_number, self.beat_classes, self.rhythm_classes, self.patient_ids, self.segment_ids]
-        return all(p.size == 0 for p in props)
+        return all(p.size == 0 for p in self._get_arrays())
+    
+    def to_df(self) -> pd.DataFrame:
+        df = pd.DataFrame({
+            "patient_id": self.patient_ids,
+            "segment_id": self.segment_ids,
+            "frame_number": self.frame_number,
+            "beat_class": self.beat_classes,
+            "rhythm_class": self.rhythm_classes,
+        })
+        return df
+    
+    def __eq__(self, other: Self):
+        return all([np.all(a == b) for a, b, in zip(self._get_arrays(), other._get_arrays())])
 
 class Icentia11k:
     """Interface to work with the Icentia11k dataset"""
@@ -243,6 +258,8 @@ class Icentia11k:
         self.ecg_encoder = ECGLabelEncoder()
         # Tan et al. 2019 used a frame length of 2^11 + 1 = 2049 (https://arxiv.org/pdf/1910.09570)
         self.frame_length = frame_length
+        # TODO: add functionality for sample_rate
+        self.sample_rate = None
 
     def create(self, patient_segments: npt.NDArray, overwrite: bool = False) -> None:
         """
@@ -268,74 +285,45 @@ class Icentia11k:
 
         if not ecg_data.is_empty():
             ecg_data.to_npz(file)
-            summary = self.summarize_dataset(ecg_data)
-            summary.to_parquet(self.dir/Path("summary.parquet.gzip"), compression="gzip")
+            ecg_data.to_df().to_parquet(self.dir/Path("summary.parquet.gzip"), compression="gzip")
         else:
             log.info("ECG data was empty")
 
-    def is_valid_patient_segment_id(self, patient_id, segment: int) -> bool:
-        """Checks if given patient and segment IDs are valid.
-        
-        Patient IDs should be in [9_000, 10_999],
-            which corresponds to the fully-labelled ECG recordings from Tan et al. 2019.
-        Segment IDs should be in [0, 49] because each patient has only 50 ~70min segments of ECG recordings.
-
-        Refer to Tan et al. 2019 (https://www.cinc.org/2021/Program/accepted/229_Preprint.pdf) for details.
-        """
-        return 0 <= patient_id <= 10_999 and 0 <= segment <= 49
-
-    def get_recording(self,
-            patient_id: int, segment_id: int,
-            start: int = 0, length: Optional[int] = None,
-            download_if_missing: bool = True
-        ) -> tuple[wfdb.Record | wfdb.MultiRecord, wfdb.Annotation]:
-        """Returns the recording and annotation data in `segment_dir`.
-        
-        Args:
-            start - the starting time/sample. Ignored if length is `None`.
-            length - the length of the segment to visualize. If `None`, it is set to full segment length
-            download - download if missing
-        """
-        if length and length <= 0:
-            raise ValueError("Expected length greater than 0")
-        if start < 0:
-            raise ValueError("Expected start greater than or equal to 0")
-        
-        if not self.is_valid_patient_segment_id(patient_id, segment_id):
-            raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
-
-        if not self.download_manager.is_patient_segment_file_exists(patient_id, segment_id) and download_if_missing:
-            self.download_manager.fetch_patient_segment(patient_id, segment_id)
-
-        segment_dir = str(self.download_manager.patient_segment_name(patient_id, segment_id))
-        
-        # TODO: Consider converting this open tar + remove extracted files to a decorator
-        with tarfile.open(self.download_manager.patient_archive_path(patient_id), "r:gz") as tar:
-            tar.extractall()
-
-            rec: wfdb.Record | wfdb.MultiRecord
-            if not length:
-                rec = wfdb.rdrecord(segment_dir)
-                ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, shift_samps=True)
-            else:
-                rec = wfdb.rdrecord(segment_dir, sampfrom=start, sampto=start+length)
-                ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
-
-            for tarinfo in tar:
-                if tarinfo.isreg():
-                    Path(tarinfo.path).unlink()
-            self.download_manager.patient_segment_name(patient_id, segment_id).parent.rmdir()
-
-        return rec, ann
-        
+    def get_aggregate_frames_and_labels(self, patient_segments: npt.NDArray) -> ECGData:
+        """Aggregate frames and labels for multiple patients and segments"""
+        ecg_data: ECGData = ECGData.new_empty()
+        for patient_id, segment_id in patient_segments:
+            try:
+                self.check_valid_patient_segment_id(patient_id, segment_id)
+                if not self.download_manager.is_patient_segment_file_exists(patient_id, segment_id):
+                    self.download_manager.fetch_patient_segment(patient_id, segment_id)
+                d = self.get_labelled_segment_frames(patient_id, segment_id)
+                ecg_data = ecg_data.combine(d)
+            except MissingECGSegmentError as e:
+                log.error(e)
+                continue
+        return ecg_data
+    
+    def print_summary(self, df: pd.DataFrame) -> None:
+        print("\nDataset Summary\n-------")
+        # Patients
+        print(len(df), "frames across", df["patient_id"].nunique(), "patients")
+        # Segments
+        print(df.groupby("patient_id")["segment_id"].nunique().mean(), "segments per patient\n")
+        # Class distribution
+        print("Class distribution (%)\n--------")
+        cls_distribution = (df[["beat_class", "rhythm_class"]].sum() / len(df)).round(4) * 100.0
+        cls_distribution.rename(index={"beat_class": "abnormal beats", "rhythm_class": "abnormal rhythm"}, inplace=True)
+        print(cls_distribution)
+    
     def get_labelled_segment_frames(self, patient_id: int, segment_id: int) -> ECGData:
         """Returns frames of ECG signal, and the corresponding beat and rhythm labels per frame
         
         Example, frame 1 contains only Normal beats, with Normal Sinusal Rhythms
         Example, frame 2 contains a Premature Atrial Contraction, with Atrial Fibrillation rhythm
         """
-        if not self.is_valid_patient_segment_id(patient_id, segment_id):
-            raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
+
+        self.check_valid_patient_segment_id(patient_id, segment_id)
 
         rec, ann = self.get_recording(patient_id, segment_id)
 
@@ -376,61 +364,59 @@ class Icentia11k:
             patient_ids=np.repeat(patient_id, n_frames),
             segment_ids=np.repeat(segment_id, n_frames).astype(np.int8),
         )
-    
-    def get_aggregate_frames_and_labels(self, patient_segments: npt.NDArray) -> ECGData:
-        """Aggregate frames and labels for multiple patients and segments"""
-        # Stack all the ECG data (frames + labels)
-        ecg_data: ECGData = ECGData.new_empty()
-        for patient, segment in patient_segments:
-            try:
-                d = self.get_labelled_segment_frames(patient, segment)
-                ecg_data = ecg_data.combine(d)
-            except MissingECGSegmentError as e:
-                log.error(e)
-                continue
-        return ecg_data
 
-    def summarize_dataset(self, ecg_data: ECGData) -> pd.DataFrame:
-        """Describes class distribution in npz file"""
-        df = pd.DataFrame({
-            "patient_id": ecg_data.patient_ids,
-            "segment_id": ecg_data.segment_ids,
-            "frame_number": ecg_data.frame_number,
-            "beat_normal": ecg_data.beat_classes[:, 0],
-            "beat_abnormal": ecg_data.beat_classes[:, 1],
-            "rhythm_normal": ecg_data.rhythm_classes[:, 0],
-            "rhythm_abnormal": ecg_data.rhythm_classes[:, 1],
-        })
-        return df
-    
-    def print_summary(self) -> None:
-        df = pd.read_parquet(self.dir/"summary.parquet.gzip")
+    def check_valid_patient_segment_id(self, patient_id, segment_id: int) -> None:
+        """Checks if given patient and segment IDs are valid.
+        
+        Patient IDs should be in [0, 10_999],
+            which corresponds to the fully-labelled ECG recordings from Tan et al. 2019.
+        Segment IDs should be in [0, 49] because each patient has only 50 ~70min segments of ECG recordings.
 
-        print("\nDataset Summary\n-------")
-        # Patients
-        print(df["patient_id"].nunique(), "patients")
-        # Segments & Frames
-        print(df["segment_id"].nunique(), "segments,", len(df), "frames\n")
-        # Class distribution
-        print("Class distribution (%)\n---------")
-        print((df[["beat_normal", "beat_abnormal", "rhythm_normal", "rhythm_abnormal"]].sum() / len(df)) * 100.0)
+        Refer to Tan et al. 2019 (https://www.cinc.org/2021/Program/accepted/229_Preprint.pdf) for details.
+        """
+        if not (0 <= patient_id <= 10_999 and 0 <= segment_id <= 49):
+            raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
+
+    def get_recording(self, patient_id: int, segment_id: int, start: int = 0, length: Optional[int] = None
+        ) -> tuple[wfdb.Record | wfdb.MultiRecord, wfdb.Annotation]:
+        """Returns the recording and annotation data in `segment_dir`.
+        
+        Args:
+            start - the starting time/sample. Ignored if length is `None`.
+            length - the length of the segment to visualize. If `None`, it is set to full segment length
+        """
+        if length and length <= 0:
+            raise ValueError("Expected length greater than 0")
+        if start < 0:
+            raise ValueError("Expected start greater than or equal to 0")
+        
+        self.check_valid_patient_segment_id(patient_id, segment_id)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+
+            with tarfile.open(self.download_manager.patient_archive_path(patient_id), "r:gz") as tar:
+                tar.extractall(path=tempdir)
+                segment_dir = str(Path(
+                    tempdir, self.download_manager.patient_name(patient_id),
+                    self.download_manager.patient_segment_name(patient_id, segment_id)))
+
+                rec: wfdb.Record | wfdb.MultiRecord
+                if not length:
+                    rec = wfdb.rdrecord(segment_dir)
+                    ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, shift_samps=True)
+                else:
+                    rec = wfdb.rdrecord(segment_dir, sampfrom=start, sampto=start+length)
+                    ann = wfdb.rdann(segment_dir, "atr", sampfrom=start, sampto=start+length, shift_samps=True)
+
+        return rec, ann
 
 if __name__ == "__main__":
     rng = np.random.default_rng(seed=2025)
 
     # TODO: Add a sample rate parameter!
     dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800)
-
-    patient_ids = rng.integers(low=9_000, high=10_999+1, size=2)
-    segment_ids = rng.integers(low=0, high=49+1, size=1)
-    patient_segments = cartesian(patient_ids, segment_ids)
-    # patient_segments = np.array([[9849, 22], [9849, 11], [9849, 14], [9850, 22], [9849, 49], [9894, 49]]) # - some specific examples
-    
-    # TODO: Overwrite=True should NOT re-download the files, it should simply overwrite the data.npz with the given patient segments
-    dataset.create(patient_segments, overwrite=False)
-    dataset.print_summary()
-
-    # TODO: There's no reason for the beat labels and the rhythm labels to be np.array's ... just make them 0/1
-    #   that should save at least a few MB.
-    #   The initial reason for having the arrays was to enable multi-label classification (since a frame could realistically contain BOTH normal and abnormal beats and rhythms)
-    #   However, this is a more difficult problem that we didn't want to tackle just yet
+    patient_segments = np.array([
+        [900, 0], # Example segment with abnormal beat 
+        [1100, 0]]) # Example segment with abnormal rhythm
+    dataset.create(patient_segments)
+    dataset.print_summary(pd.read_parquet(dataset.dir/"summary.parquet.gzip"))

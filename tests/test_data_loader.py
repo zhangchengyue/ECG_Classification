@@ -85,33 +85,57 @@ class TestECGLabelEncoder:
 
         # Normal
         normal_beat_frame = np.array(['N'] * 10)
-        assert np.all(encoder.reclassify_beats_in_frame(normal_beat_frame) == np.array([1, 0]))
+        assert encoder.reclassify_beats_in_frame(normal_beat_frame) == 0
 
         # Abnormal
         abnormal_beat_frame = np.array(['N'] * 10 + ['S'])
-        assert np.all(encoder.reclassify_beats_in_frame(abnormal_beat_frame) == np.array([0, 1]))
+        assert encoder.reclassify_beats_in_frame(abnormal_beat_frame) == 1
 
     def test_rhythm_label_encoding(self):
         encoder = ECGLabelEncoder()
 
         # Normal
         normal_rhythm_frame = np.array(['(N'] * 10)
-        assert np.all(encoder.reclassify_rhythm_in_frame(normal_rhythm_frame) == np.array([1, 0]))
+        assert encoder.reclassify_rhythm_in_frame(normal_rhythm_frame) == 0
 
         # Abnormal
         abnormal_rhythm_frame = np.array(['(N'] * 10 + ['(AFIB'])
-        assert np.all(encoder.reclassify_rhythm_in_frame(abnormal_rhythm_frame) == np.array([0, 1]))
+        assert encoder.reclassify_rhythm_in_frame(abnormal_rhythm_frame) == 1
 
-    def test_is_valid_patient_segment(self):
+    def test_check_valid_patient_segment_id(self):
         dataset = Icentia11k(dir=Path("./data/icentia11k"), frame_length=800)
 
-        assert dataset.is_valid_patient_segment_id(patient_id=9_000, segment=0), "Lower patient & segment bounds"
-        assert dataset.is_valid_patient_segment_id(patient_id=10_999, segment=49), "Upper patient & segment bounds"
-        assert not dataset.is_valid_patient_segment_id(patient_id=9_000, segment=50), "Invalid segment ID only"
-        assert not dataset.is_valid_patient_segment_id(patient_id=11_000, segment=3), "Invalid patient ID only"
-        assert not dataset.is_valid_patient_segment_id(patient_id=0, segment=100), "Invalid patient & segment ID"
+        assert dataset.check_valid_patient_segment_id(patient_id=9_000, segment_id=0) is None
+        assert dataset.check_valid_patient_segment_id(patient_id=10_999, segment_id=49) is None
+
+        with pytest.raises(ValueError): 
+            # Invalid segment ID only
+            dataset.check_valid_patient_segment_id(patient_id=9_000, segment_id=50)
+            # Invalid patient ID only
+            dataset.check_valid_patient_segment_id(patient_id=11_000, segment_id=3)
+            # Invalid patient & segment ID
+            dataset.check_valid_patient_segment_id(patient_id=0, segment_id=100)
 
 class TestECGData:
+
+    def test_combine(self):
+        a = ECGData(
+            frames=np.array([[1, 2, 3], [4, 5, 6]]),
+            frame_number=np.array([1, 2]),
+            beat_classes=np.array([0, 1]),
+            rhythm_classes=np.array([0, 0]),
+            patient_ids=np.array([900, 901]),
+            segment_ids=np.array([0, 1]),
+        )
+        b = a.combine(a)
+        assert b == ECGData(
+            frames=np.array([[1, 2, 3], [4, 5, 6], [1, 2, 3], [4, 5, 6]]),
+            frame_number=np.array([1, 2, 1, 2]),
+            beat_classes=np.array([0, 1, 0, 1]),
+            rhythm_classes=np.array([0, 0, 0, 0]),
+            patient_ids=np.array([900, 901, 900, 901]),
+            segment_ids=np.array([0, 1, 0, 1]),
+        )
 
     def test_empty_ecgdata_is_empty(self):
         data: ECGData = ECGData.new_empty()
