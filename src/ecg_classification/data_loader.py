@@ -13,6 +13,7 @@ import shutil
 import time
 from typing import Optional, Self
 import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -23,8 +24,8 @@ import wfdb
 
 from ecg_classification.utils import cartesian
 
-log = logging.getLogger()
-logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s - %(message)s")
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format="%(name)s:%(funcName)s:%(lineno)s %(levelname)s - %(message)s")
 
 class MissingECGSegmentError(Exception):
     """Error for when a patient segment is missing from the dataset"""
@@ -37,7 +38,6 @@ class DownloadManager:
     ECG_FILE_EXTENSIONS = ("atr", "hea", "dat")
 
     def __init__(self, output_dir: Path):
-        # We use absolute paths because it makes things easier for working with tar files
         self.output_dir = output_dir.absolute()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -60,57 +60,33 @@ class DownloadManager:
         if self.is_patient_segment_file_exists(patient_id, segment_id):
             return
 
-        patient_url_dir = self.patient_url(patient_id)
+        with tempfile.TemporaryDirectory() as tempdir:
+            base_dir = Path(tempdir, self.patient_name(patient_id))
+            base_dir.mkdir(parents=True, exist_ok=True)
 
-        tmp_write_path = self.output_dir/self.patient_name(patient_id)
-        tmp_write_path.mkdir(parents=True, exist_ok=True)
+            if self.patient_archive_path(patient_id).exists():
+                with tarfile.open(self.patient_archive_path(patient_id), "r:gz") as tar:
+                    tar.extractall(path=tempdir)
 
-        for file in self.patient_segment_files(patient_id, segment_id):
-            try:
-                # This check is a little redundant, but in the future I might want to consider re-requesting as needed
-                if file.exists():
-                    log.info(f"{file.name} already fetched")
-                    continue
-                self.download_file(
-                    f"{patient_url_dir}/{file}",
-                    tmp_write_path/file
-                )
-            except urllib.error.URLError as e:
-                # Remove the whole segment - it could be the case that 2/3 files were successfully downloaded,
-                #   but in that case we throw out the whole segment as unusable
-                shutil.rmtree(tmp_write_path)
-                raise MissingECGSegmentError(f"Could not obtain p{patient_id:05d}_s{segment_id:02d}")
-            
-        # Have other segments for this patient been downloaded too? 
-        #   If so, extract those so they can be included in the archive too
-        #   We do this because there is no way to open the tar.gz in append mode, only read or (over)write
-        if self.patient_archive_path(patient_id).exists():
-            with tarfile.open(self.patient_archive_path(patient_id), "r:gz") as tar:
-                tar.extractall()
+            # Download segment files
+            for file in self.patient_segment_files(patient_id, segment_id):
+                try:
+                    url = f"{self.patient_url(patient_id)}/{file.name}"
+                    log.info(f"Downloading {url}")
+                    with urllib.request.urlopen(url) as response:
+                        contents = response.read()
+                        (base_dir/file.name).write_bytes(contents)
+                    # A cooldown to reduce load on the web server
+                    time.sleep(3)
+                except urllib.error.URLError as e:
+                    raise MissingECGSegmentError(f"Could not download {self.patient_segment_name(patient_id, segment_id)}")
 
-        # Archive & compress
-        with tarfile.open(self.patient_archive_path(patient_id), "w:gz") as tar:
-            tar.add(tmp_write_path)
-
-        # Remove uncompressed files
-        shutil.rmtree(tmp_write_path)
-
-    def download_file(self, url: str, out: Path, sleep: int = 3) -> bytes:
-        """Downloads a file using HTTPS.
-        
-        Args
-            sleep - cooldown before makin another request. A courtesy to reduce load on web servers.
-        """
-        log.info(f"Downloading {url}")
-        with urllib.request.urlopen(url) as response:
-            contents = response.read()
-            out.write_bytes(contents)
-        time.sleep(sleep)
-
-    def rmdir(self, dir: Path) -> None:
-        for file in dir.iterdir():
-            file.unlink()
-        dir.rmdir()
+            shutil.make_archive(
+                self.output_dir/self.patient_name(patient_id),
+                "gztar",
+                root_dir=tempdir,
+                base_dir=base_dir.name,
+            )
 
     def is_patient_segment_file_exists(self, patient_id: int, segment_id: int) -> bool:
         """Checks if patient segment has already been downloaded"""
@@ -119,8 +95,7 @@ class DownloadManager:
         
         with tarfile.open(self.patient_archive_path(patient_id), "r:gz") as tar:
             for file in self.patient_segment_files(patient_id, segment_id):
-                # Absolute paths in tarfile do not have prepending '/'
-                fname = str(file).lstrip("/")
+                fname = f"{file.parent.name}/{file.name}"
                 if fname in tar.getnames():
                     return True
         return False

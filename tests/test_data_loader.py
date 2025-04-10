@@ -49,24 +49,13 @@ class TestDownloadManager:
         # Create a temporary tar.gz file
         with tarfile.open(tmp_path/"p00900.tar.gz", "w:gz") as tar:
             for file in ["p00900_s00.atr", "p00900_s00.hea", "p00900_s00.dat"]:
-                p = Path(tmp_path, "p00900", file)
+                p = Path("p00900", file)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.touch()
                 tar.add(p)
 
         assert downloader.is_patient_segment_file_exists(900, 0)
         assert not downloader.is_patient_segment_file_exists(900, 4)
-
-    def test_download_files_does_not_write_file_on_url_error(self):
-        import urllib
-        
-        downloader = DownloadManager(Path("."))
-        file = downloader.output_dir/Path("out.txt")
-
-        with pytest.raises(urllib.error.URLError):
-            downloader.download_file("https://unreachable.gov", file)
-
-        assert not file.exists()
 
 class TestECGLabelEncoder:
 
