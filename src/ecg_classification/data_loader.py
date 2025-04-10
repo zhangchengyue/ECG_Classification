@@ -30,7 +30,6 @@ class MissingECGSegmentError(Exception):
     """When a patient segment is missing from the dataset"""
     pass
 
-
 class DownloadManager:
     """Manages downloads for dataset"""
 
@@ -39,6 +38,7 @@ class DownloadManager:
     TOTAL_SEGMENTS = 50
 
     def __init__(self, output_dir: Path):
+        # TODO: Use absolute path, NOT relative path!
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -443,6 +443,7 @@ class Icentia11k:
 if __name__ == "__main__":
     rng = np.random.default_rng(seed=2025)
 
+    # TODO: Add a sample rate parameter!
     dataset = Icentia11k(Path("./data/icentia11k"), frame_length=800)
 
     patient_ids = rng.integers(low=9_000, high=10_999+1, size=2)
@@ -450,6 +451,7 @@ if __name__ == "__main__":
     patient_segments = cartesian(patient_ids, segment_ids)
     # patient_segments = np.array([[9849, 22], [9849, 11], [9849, 14], [9850, 22], [9849, 49], [9894, 49]]) # - some specific examples
     
+    # TODO: Overwrite=True should NOT re-download the files, it should simply overwrite the data.npz with the given patient segments
     dataset.create(patient_segments, overwrite=False)
     dataset.print_summary()
 
