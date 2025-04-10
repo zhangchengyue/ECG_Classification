@@ -9,7 +9,7 @@ https://physionet.org/content/icentia11k-continuous-ecg/1.0/
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-import random
+import shutil
 import time
 from typing import Optional, Self
 import tarfile
@@ -27,87 +27,79 @@ log = logging.getLogger()
 logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s - %(message)s")
 
 class MissingECGSegmentError(Exception):
-    """When a patient segment is missing from the dataset"""
+    """Error for when a patient segment is missing from the dataset"""
     pass
 
 class DownloadManager:
-    """Manages downloads for dataset"""
+    """Downloads data from Icentia11k dataset"""
 
     DATASET_URL = "https://physionet.org/files/icentia11k-continuous-ecg/1.0"
     ECG_FILE_EXTENSIONS = ("atr", "hea", "dat")
-    TOTAL_SEGMENTS = 50
 
     def __init__(self, output_dir: Path):
-        # TODO: Use absolute path, NOT relative path!
-        self.output_dir = output_dir
+        # We use absolute paths because it makes things easier for working with tar files
+        self.output_dir = output_dir.absolute()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # TODO: Save multiple segments belonging to one patient in the same p#####.tar.gz
     def fetch_patient_segment(self, patient_id: int, segment_id: int) -> None:
         """Fetches patient data from Icentia11k dataset.
         
         The data is hosted at PhysioNet, here: https://physionet.org/files/icentia11k-continuous-ecg/1.0
         Refer to Tan et al. https://arxiv.org/pdf/1910.09570 for more information.
-
         If the patient segment doesn't exist, then this doesn't fetch anything and raises an error.
 
+        Args:
+            patient_id: id number for patient
+            segment_id: id number for patient's segment
+
         Raises:
-            MissingSegmentError
+            MissingSegmentError - raised if the requested patient segment does not exist in the dataset or is incomplete,
+                i.e. does not contain all three ECG files (.atr, .hea, and .dat)
         """
 
-        patient_folder = f"p{patient_id:05d}"
-        patient_folder_url = self._get_patient_folder_url(patient_folder)
-
-        write_path = self.output_dir/patient_folder
-        write_path.mkdir(parents=True, exist_ok=True)
-
-        if self.is_patient_segment_stored_locally(patient_id, segment_id):
+        if self.is_patient_segment_file_exists(patient_id, segment_id):
             return
 
-        # Define file urls to fetch
-        files_to_download: list[Path] = []
-        for ext in self.ECG_FILE_EXTENSIONS:
-            files_to_download.append(Path(f"{patient_folder}_s{segment_id:02d}.{ext}"))
+        patient_url_dir = self.patient_url(patient_id)
 
-        # Download files
-        for file in files_to_download:
+        tmp_write_path = self.output_dir/self.patient_name(patient_id)
+        tmp_write_path.mkdir(parents=True, exist_ok=True)
+
+        for file in self.patient_segment_files(patient_id, segment_id):
             try:
                 # This check is a little redundant, but in the future I might want to consider re-requesting as needed
                 if file.exists():
                     log.info(f"{file.name} already fetched")
                     continue
                 self.download_file(
-                    f"{patient_folder_url}/{file}",
-                    write_path/file
+                    f"{patient_url_dir}/{file}",
+                    tmp_write_path/file
                 )
             except urllib.error.URLError as e:
                 # Remove the whole segment - it could be the case that 2/3 files were successfully downloaded,
                 #   but in that case we throw out the whole segment as unusable
-                for file in write_path.iterdir():
-                    if file.is_file():
-                        file.unlink()
-                write_path.rmdir()
+                shutil.rmtree(tmp_write_path)
                 raise MissingECGSegmentError(f"Could not obtain p{patient_id:05d}_s{segment_id:02d}")
             
         # Have other segments for this patient been downloaded too? 
         #   If so, extract those so they can be included in the archive too
         #   We do this because there is no way to open the tar.gz in append mode, only read or (over)write
-        if self.get_patient_tar_gz_path(patient_id).exists():
-            with tarfile.open(self.get_patient_tar_gz_path(patient_id), "r:gz") as tar:
+        if self.patient_archive_path(patient_id).exists():
+            with tarfile.open(self.patient_archive_path(patient_id), "r:gz") as tar:
                 tar.extractall()
 
         # Archive & compress
-        with tarfile.open(self.get_patient_tar_gz_path(patient_id), "w:gz") as tar:
-            tar.add(write_path)
+        with tarfile.open(self.patient_archive_path(patient_id), "w:gz") as tar:
+            tar.add(tmp_write_path)
 
         # Remove uncompressed files
-        for file in write_path.iterdir():
-            file.unlink()
-        write_path.rmdir()
+        shutil.rmtree(tmp_write_path)
 
     def download_file(self, url: str, out: Path, sleep: int = 3) -> bytes:
         """Downloads a file using HTTPS.
-        Sleeps for `sleep` seconds to prevent too many requests in a short time.
+        
+        Args
+            sleep - cooldown before makin another request. A courtesy to reduce load on web servers.
         """
         log.info(f"Downloading {url}")
         with urllib.request.urlopen(url) as response:
@@ -115,36 +107,44 @@ class DownloadManager:
             out.write_bytes(contents)
         time.sleep(sleep)
 
-    def is_patient_segment_stored_locally(self, patient_id: int, segment_id: int) -> bool:
+    def rmdir(self, dir: Path) -> None:
+        for file in dir.iterdir():
+            file.unlink()
+        dir.rmdir()
+
+    def is_patient_segment_file_exists(self, patient_id: int, segment_id: int) -> bool:
         """Checks if patient segment has already been downloaded"""
-        patient_folder = f"p{patient_id:05d}" # TODO: Replace with some call to self.get_patient_folder()
-        if not self.get_patient_tar_gz_path(patient_id).exists():
+        if not self.patient_archive_path(patient_id).exists():
             return False
         
-        write_path = self.output_dir/patient_folder
-        with tarfile.open(self.get_patient_tar_gz_path(patient_id), "r:gz") as tar:
-            for ext in self.ECG_FILE_EXTENSIONS:
-                file = write_path/f"{patient_folder}_s{segment_id:02d}.{ext}"
-                if str(file) in tar.getnames():
+        with tarfile.open(self.patient_archive_path(patient_id), "r:gz") as tar:
+            for file in self.patient_segment_files(patient_id, segment_id):
+                # Absolute paths in tarfile do not have prepending '/'
+                fname = str(file).lstrip("/")
+                if fname in tar.getnames():
                     return True
         return False
-
-    def _get_patient_folder_url(self, patient_folder: str) -> str:
-        return "/".join([self.DATASET_URL, patient_folder[:3], patient_folder])
     
-    def get_patient_folder_path(self, patient_id: int, segment_id: int) -> Path:
-        """Gets local path to patient segment ECG recording
-        
-        Naming convention for folders is the same as in PhysioNet
-        """
-        patient_folder = f"p{patient_id:05d}"
-        path = self.output_dir/Path(patient_folder, f"{patient_folder}_s{segment_id:02d}")
-        return path
+    def patient_name(self, patient_id: int) -> str:
+        return f"p{patient_id:05d}"
     
-    def get_patient_tar_gz_path(self, patient_id: int) -> Path:
-        patient_folder = f"p{patient_id:05d}"
-        return self.output_dir/f"{patient_folder}.tar.gz"
-
+    def patient_url(self, patient_id: int) -> str:
+        patient_dir = self.patient_name(patient_id)
+        return "/".join([self.DATASET_URL, patient_dir[:3], patient_dir])
+    
+    def patient_archive_path(self, patient_id: int) -> Path:
+        return self.output_dir/f"{self.patient_name(patient_id)}.tar.gz"
+    
+    def patient_segment_name(self, patient_id: int, segment_id: int) -> str:
+        return f"{self.patient_name(patient_id)}_s{segment_id:02d}"
+    
+    def patient_segment_path(self, patient_id: int, segment_id: int) -> Path:
+        return self.output_dir/Path(self.patient_name(patient_id), self.patient_segment_name(patient_id, segment_id))
+    
+    def patient_segment_files(self, patient_id: int, segment_id: int) -> list[Path]:
+        seg_dir = self.patient_segment_path(patient_id, segment_id)
+        return [Path(f"{seg_dir}.{ext}") for ext in self.ECG_FILE_EXTENSIONS]
+    
 class ECGLabelEncoder:
     """Encodes labels for ECG recordings"""
 
@@ -329,13 +329,13 @@ class Icentia11k:
         if not self.is_valid_patient_segment_id(patient_id, segment_id):
             raise ValueError(f"Expected valid (patient_id, segment_id), got {(patient_id, segment_id)}")
 
-        if not self.download_manager.is_patient_segment_stored_locally(patient_id, segment_id) and download_if_missing:
+        if not self.download_manager.is_patient_segment_file_exists(patient_id, segment_id) and download_if_missing:
             self.download_manager.fetch_patient_segment(patient_id, segment_id)
 
-        segment_dir = str(self.download_manager.get_patient_folder_path(patient_id, segment_id))
+        segment_dir = str(self.download_manager.patient_segment_name(patient_id, segment_id))
         
         # TODO: Consider converting this open tar + remove extracted files to a decorator
-        with tarfile.open(self.download_manager.get_patient_tar_gz_path(patient_id), "r:gz") as tar:
+        with tarfile.open(self.download_manager.patient_archive_path(patient_id), "r:gz") as tar:
             tar.extractall()
 
             rec: wfdb.Record | wfdb.MultiRecord
@@ -349,7 +349,7 @@ class Icentia11k:
             for tarinfo in tar:
                 if tarinfo.isreg():
                     Path(tarinfo.path).unlink()
-            self.download_manager.get_patient_folder_path(patient_id, segment_id).parent.rmdir()
+            self.download_manager.patient_segment_name(patient_id, segment_id).parent.rmdir()
 
         return rec, ann
         
