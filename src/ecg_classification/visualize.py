@@ -19,9 +19,6 @@ def plot_ecg(signal: npt.NDArray, ax: Optional[plt.Axes] = None) -> plt.Axes:
     return ax
 
 def plot_multiple_ecg(signals: list[npt.NDArray], labels: list[str], layout: str = "vstack") -> plt.Axes:
-    # Figure out layout
-    # Figure out plot indices of signals
-    # Plot them
     _layout = None
     if layout == "overlay":
         _layout = (1, 1)
@@ -38,8 +35,6 @@ def plot_multiple_ecg(signals: list[npt.NDArray], labels: list[str], layout: str
         else:
             ax[i].plot(time, s, label=lbl)
             ax[i].legend()
-        # ax.get_xaxis().set_visible(False)
-        # ax.get_yaxis().set_visible(False)
     return fig, ax
 
     # if layout == "overlay":
