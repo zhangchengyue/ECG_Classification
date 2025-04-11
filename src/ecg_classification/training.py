@@ -6,9 +6,12 @@ Refer to https://github.com/shawntan/icentia-ecg/blob/master/eval.py
 """
 
 from dataclasses import dataclass
+import math
 
+import numpy as np
 import numpy.typing as npt
 from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.utils import resample
 
 @dataclass
 class DataSplit:
@@ -47,3 +50,23 @@ def print_split_summary(split: DataSplit) -> None:
     beat, rhythm = split.y_beat, split.y_rhythm
     print(f"{beat.sum()}/{len(beat)} ({beat.sum()/len(beat):.4f}) abnormal beats")
     print(f"{rhythm.sum()}/{len(rhythm)} ({rhythm.sum()/len(rhythm):.4f}) abnormal rhythms")
+
+def randomly_oversample_minority_class(train_split: DataSplit, ratio: float, random_state: int) -> DataSplit:
+    """Oversamples minority class to balance training set
+    Note! Do not apply to test set, otherwise you risk overinflating performance.
+    Already, random sampling risks overfitting, and isn't ideal, but might be better than nothing.
+    
+    Args:
+        split: the split of data
+        ratio: ratio of minority:majority class
+    """
+    num_rhythm = train_split.y_rhythm.sum()
+    num_normal = len(train_split.y_rhythm) - num_rhythm
+    n_samples = num_rhythm * math.ceil(ratio / (num_rhythm/num_normal))
+
+    idx = np.argwhere(train_split.y_rhythm == 1)[:, 0]
+    X, y_rhythm, y_beat = resample(train_split.X[idx], train_split.y_rhythm[idx], train_split.y_beat[idx], n_samples=n_samples, random_state=random_state)
+    X = np.concatenate([X, train_split.X], axis=0)
+    y_rhythm = np.concatenate([y_rhythm, train_split.y_rhythm])
+    y_beat = np.concatenate([y_beat, train_split.y_beat])
+    return DataSplit("train", X, y_rhythm, y_beat)
