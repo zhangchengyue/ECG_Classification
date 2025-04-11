@@ -26,8 +26,13 @@ def preprocess_ecg_signals(X: npt.NDArray, conv_window_size: int = 3) -> npt.NDA
 class SyntheticNoise:
     """Generates synthetic noise"""
 
-    def gaussian_noise(self):
-        raise NotImplementedError()
+    def __init__(self, random_state: int):
+        self.rng = np.random.default_rng(seed=random_state)
+
+    def gaussian_noise(self, x: npt.NDArray, stddev: float) -> npt.NDArray:
+        noisy_array = x + np.random.normal(loc=0.0, scale=stddev, size=x.shape)
+        noisy_array = normalize(noisy_array, norm="max", axis=1)
+        return noisy_array
 
     def powerline_interference(self):
         raise NotImplementedError()
